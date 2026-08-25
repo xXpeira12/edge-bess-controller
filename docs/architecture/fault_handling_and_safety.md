@@ -17,7 +17,7 @@ This document is the authoritative **Single Source of Truth** for the multi-tier
 |  | TIER 0: SILICON HARDWARE BREAK (Autonomous, <= 2.0 microseconds total path)                 |  |
 |  | - Over-Current: |I| > 5.0A (0.650V / 2.650V) -> T_trip,OC = 491 ns worst-case                  |  |
 |  | - Over-Voltage: V_bus > 26.0V (2.600V)       -> T_trip,OV = 341 ns worst-case                  |  |
-|  | - Internal COMP1/2/3 -> HRTIM1_FLT1/2/3 -> Hardware PWM Disable. Latched in Silicon.        |  |
+|  | - Internal COMP1/2/3 -> HRTIM1_FLT4/1/5 -> Hardware PWM Disable. Latched in Silicon.        |  |
 |  +---------------------------------------------------------------------------------------------+  |
 |                                                |                                                  |
 |                                                v                                                  |
