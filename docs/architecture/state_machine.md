@@ -137,11 +137,7 @@ The Control MCU firmware executes a hierarchical timing architecture:
 * **Actions:** Clamps active current setpoint $I_{ref}$ to derated envelope ($20\% - 50\%$ nominal).
 * **Exit:** Temperature $< 50^\circ\text{C}$ for $> 5.0\text{ s}$ $\to$ Returns to Active State.
 
-### 2.7 State 8: `STATE_SAFE_STATE`
-* **Actions:** Hardware Break forces PWM `LOW` $\le 2.0\,\mu\text{s}$. Latches `FAULT_CODE` in register `40010`.
-* **Exit:** Receives authenticated fault clear command `FAULT_CLEAR_CMD = 0x00A5` $\to$ Transitions to `STATE_RECOVERY_CHECK`.
-
-### 2.8 State 9: `STATE_RECOVERY_CHECK`
+### 2.7 State 8: `STATE_RECOVERY_CHECK`
 * **Entry:** Fault clear request received in `STATE_SAFE_STATE`.
 * **Actions:**
   - Confirms DC bus voltage is within safe band ($16.0\text{ V} \le V_{bus} \le 25.0\text{ V}$).
@@ -151,3 +147,7 @@ The Control MCU firmware executes a hierarchical timing architecture:
 * **Exit:**
   - If all checks pass $\to$ Transitions to `STATE_IDLE`. (Power conversion remains STOPPED until a new explicit `START` command is issued).
   - If any check fails $\to$ Re-latches fault and returns to `STATE_SAFE_STATE`.
+
+### 2.8 State 9: `STATE_SAFE_STATE`
+* **Actions:** Hardware Break forces PWM `LOW` $\le 2.0\,\mu\text{s}$. Latches `FAULT_CODE` in register `40010`.
+* **Exit:** Receives authenticated fault clear command `FAULT_CLEAR_CMD = 0x00A5` $\to$ Transitions to `STATE_RECOVERY_CHECK`.

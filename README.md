@@ -117,7 +117,7 @@ To maintain academic and industrial rigor without overstating regulatory status 
   +------------------------------------------------------------------------------------------------+
 ```
 
-* **`REQ-SENS-001` (DC Bus Voltage Sensing & Anti-Aliasing):** DC bus voltage is attenuated via a $10:1$ divider ($R_1 = 90.0\text{ k}\Omega, R_2 = 10.0\text{ k}\Omega \pm 0.1\%$). An op-amp buffer feeds a first-order RC anti-aliasing filter ($R = 1.0\text{ k}\Omega, C = 3.3\text{ nF}, f_c = 48.2\text{ kHz}$). At the $25\text{ kHz}$ Nyquist frequency, attenuation is $-1.7\text{ dB}$; at the $50\text{ kHz}$ switching frequency, attenuation is $-4.5\text{ dB}$, with phase lag deterministically compensated in PID loop coefficients.
+* **`REQ-SENS-001` (DC Bus Voltage Sensing & Anti-Aliasing):** DC bus voltage is attenuated via a $10:1$ divider ($R_1 = 90.0\text{ k}\Omega, R_2 = 10.0\text{ k}\Omega \pm 0.1\%$). An op-amp buffer feeds a first-order RC anti-aliasing filter ($R = 1.0\text{ k}\Omega, C = 3.3\text{ nF}, f_c = 48.2\text{ kHz}$). At the $25\text{ kHz}$ Nyquist frequency, attenuation is $-1.04\text{ dB}$; at the $50\text{ kHz}$ switching frequency, attenuation is $-3.17\text{ dB}$, with phase lag deterministically compensated in PID loop coefficients.
 * **`REQ-SENS-002` (Current Sensing Transfer Function):** Current is sensed via a $10\text{ m}\Omega$ precision shunt and an INA240 Current Sense Amplifier configured with Gain $G = 40\text{ V/V}$ and mid-rail reference $V_{REF} = 1.650\text{ V}$:
   $$V_{csa\_out} = 1.650\text{ V} + (I_L \times 0.010\,\Omega \times 40\,\text{V/V}) = 1.650\text{ V} + (I_L \times 0.400\,\text{V/A})$$
   - Continuous $\pm 3.5\text{ A}$ operating range maps to $0.250\text{ V} \dots 3.050\text{ V}$ ($310 \dots 3785$ ADC counts on 12-bit 3.3V ADC), leaving generous headroom against $0\text{V}$ and $3.3\text{V}$ rail saturation.
@@ -167,8 +167,8 @@ To ensure rigorous real-time determinism across the power stage, four distinct t
 |  TIER 0: SILICON HARDWARE BREAK (Autonomous, <= 2.0 microseconds total path)                      |
 |  - Trigger: I > 5.0A or V_bus > 26.0V (Analog Comparators COMP1/COMP2)                            |
 |  - Action: HRTIM/TIM1 BKIN asynchronously forces PWM LOW / High-Z. Latched in silicon.            |
-|  - Latency: Sensor(350ns) + COMP(16ns) + Matrix(5ns) + Timer(25ns) + Driver(20ns) + Gate(60ns)    |
-|             = ~476 ns worst-case total latency (<< 2.0 us limit). Zero CPU dependency.            |
+|  - Latency: Sensor(350ns) + COMP(25ns) + Matrix(5ns) + Timer(25ns) + Driver(20ns) + Gate(60ns)    |
+|             = 485 ns worst-case total latency (<< 2.0 us limit). Zero CPU dependency.             |
 |                                                                                                   |
 |  TIER 1: SOFTWARE EMERGENCY RAMP-DOWN (Fast Supervisory, 100 A/s Slew Rate)                       |
 |  - Trigger: Level 2 Fault (Soft OC > 4.0A, Soft OT > 65C, UVLO < 9.5V, IPC Timeout > 500ms)       |
