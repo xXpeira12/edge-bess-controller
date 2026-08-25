@@ -5,16 +5,18 @@
 
 ---
 
-## 1. Modbus Control Policy & Safety Boundary
+## 1. Single Source of Truth: Modbus Control Policy & Safety Boundaries
+
+This document is the authoritative **Single Source of Truth** for the SCADA Modbus-TCP / RTU Holding Register Map ($40001 - 40018$), data types, engineering scalings, sentinels, mailbox semantics, command result codes, and access permissions.
 
 ### 1.1 Strict Safety Rule
 > **CRITICAL SAFETY RESTRICTION:** Direct manipulation or writing of PWM duty cycles, timer period registers, dead-time parameters, or raw inner-loop PID gains via Modbus is **STRICTLY PROHIBITED**.
 
-### 1.2 Architectural Rationale & Supervisory Gatekeeper
-Modbus is a non-deterministic industrial fieldbus protocol. The Gateway Core (ESP32) acts as a supervisory validation gatekeeper:
-1. **Command Filtering:** Only high-level operational commands (`SYS_CONTROL_CMD` and `FAULT_CLEAR_CMD`) are processed.
-2. **Dedicated Fault Clear Command (Register `40014`):** Clearing latched faults requires an explicit write of `0x00A5` to register `40014`. Writing to command register `40001` cannot clear faults.
-3. **Atomic Multi-Register Snapshot:** Telemetry registers ($40002 - 40013$) are latched atomically in a shadow memory buffer upon receiving Function Code `0x03` to prevent reading torn 32-bit data (e.g. `UPTIME_MSW`/`LSW`).
+### 1.2 Mailbox Command Semantics & Atomicity Snapshot
+1. **Edge-Triggered Mailbox:** `SYS_CONTROL_CMD` (Register `40001`) acts as an edge-triggered command mailbox. Writing a valid value triggers an IPC transaction to the Control MCU.
+2. **Dedicated Fault Clear Key (Register `40014`):** Latched faults can only be cleared by writing the magic key `0x00A5` to `FAULT_CLEAR_CMD`. Writing `0` to register `40001` stops power conversion but does not clear faults.
+3. **Atomic Multi-Register Snapshot:** Upon receipt of Modbus Function Code `0x03` covering registers $40002 - 40018$, the Gateway creates a coherent shadow memory snapshot, guaranteeing that 32-bit values (such as `UPTIME_MSW`/`LSW`) are read without tear.
+4. **Exception Handling:** Writing to any read-only register ($40002 - 40013$, $40015 - 40018$) returns Modbus Exception Code `0x02` (`Illegal Data Address`).
 
 ---
 
@@ -32,14 +34,14 @@ Modbus is a non-deterministic industrial fieldbus protocol. The Gateway Core (ES
 | **`40008`** | `TEMPERATURE` | `int16_t` | $0.1^\circ\text{C} / \text{LSB}$ | Read-Only | $-200 \dots +1250$, `0x7FFF` | Power Stage Heatsink Temperature ($265 = 26.5^\circ\text{C}$). Sentinel: `0x7FFF`. |
 | **`40009`** | `OPERATING_MODE` | `uint16_t` | Enum | Read-Only | `0 - 3` | High-Level Operating Mode:<br>`0` = `IDLE`<br>`1` = `CHARGE`<br>`2` = `DISCHARGE`<br>`3` = `SAFE_STATE` |
 | **`40010`** | `FAULT_CODE` | `uint16_t` | Hex Code | Read-Only | `0x0000 - 0xFFFF` | Diagnostic hex code of highest priority active fault. |
-| **`40011`** | `FW_VERSION` | `uint16_t` | BCD Format | Read-Only | `0x0000 - 0x9999` | Firmware version in BCD (`0x0130` = v1.3.0). |
+| **`40011`** | `FW_VERSION` | `uint16_t` | BCD Format | Read-Only | `0x0000 - 0x9999` | Firmware version in BCD (`0x0200` = v2.0.0). |
 | **`40012`** | `UPTIME_MSW` | `uint16_t` | Seconds | Read-Only | $0 - 65535$ | System Uptime 32-bit Counter (MSW). |
 | **`40013`** | `UPTIME_LSW` | `uint16_t` | Seconds | Read-Only | $0 - 65535$ | System Uptime 32-bit Counter (LSW). |
 | **`40014`** | `FAULT_CLEAR_CMD` | `uint16_t` | Magic Key | R/W | `0x00A5` | Dedicated Fault Clear Register. Writing `0x00A5` requests transition to `RECOVERY_CHECK`. |
-| **`40015`** | `CMD_RESULT` | `uint16_t` | Enum | Read-Only | `0` = OK, `1` = Error, `2` = Rejected | Execution result of last received command. |
+| **`40015`** | `CMD_RESULT` | `uint16_t` | Enum | Read-Only | `0 - 6` | `0` = None<br>`1` = Accepted<br>`2` = Rejected_InvalidState<br>`3` = Rejected_FaultActive<br>`4` = Rejected_Limit<br>`5` = Rejected_Safety<br>`6` = Rejected_IPC |
 | **`40016`** | `CMD_SEQ` | `uint16_t` | Counter | Read-Only | $0 - 65535$ | Monotonic sequence number echo of last command. |
-| **`40017`** | `FSM_STATE` | `uint16_t` | Enum | Read-Only | $0 - 9$ | Detailed Internal FSM State Enum (see Section 3). |
-| **`40018`** | `LATCHED_FAULT_FLAGS`|`uint16_t`| Bitfield | Read-Only | `0x0000 - 0xFFFF` | Latched historical fault bitmap (retained until cleared by register 40014). |
+| **`40017`** | `FSM_STATE` | `uint16_t` | Enum | Read-Only | `0 - 9` | Detailed Internal FSM State ($0-9$). |
+| **`40018`** | `LATCHED_FAULT_FLAGS`|`uint16_t`| Bitfield | Read-Only | `0x0000 - 0xFFFF` | Latched historical fault bitmap (cleared by 40014). |
 
 ---
 
@@ -55,20 +57,3 @@ Modbus is a non-deterministic industrial fieldbus protocol. The Gateway Core (ES
 * `7`: `STATE_DERATING_ACTIVE`
 * `8`: `STATE_RECOVERY_CHECK`
 * `9`: `STATE_SAFE_STATE`
-
----
-
-## 4. `ACTIVE_FAULT_FLAGS` & `LATCHED_FAULT_FLAGS` Bit Assignments
-
-| Bit | Symbol | Trigger Condition | Severity |
-| :--- | :--- | :--- | :--- |
-| **`Bit 0`** | `FLAG_OVER_VOLTAGE` | $V_{bus} > 25.0\text{ V}$ (Soft) or $> 26.0\text{ V}$ (Hard) | WARNING / CRITICAL |
-| **`Bit 1`** | `FLAG_OVER_CURRENT` | $|I| > 4.0\text{ A}$ (Soft) or $> 5.0\text{ A}$ (Hard) | WARNING / CRITICAL |
-| **`Bit 2`** | `FLAG_OVER_TEMP` | Heatsink Temperature $T > 65.0^\circ\text{C}$ | WARNING / FAULT |
-| **`Bit 3`** | `FLAG_UNDER_VOLTAGE` | Battery Voltage $V_{bat} < 10.0\text{ V}$ | WARNING / FAULT |
-| **`Bit 4`** | `FLAG_IPC_COMM_LOST` | SPI DMA heartbeat lost $> 500\text{ ms}$ | FAULT |
-| **`Bit 5`** | `FLAG_IEC_SELFTEST_FAIL`| Startup or runtime IEC 60730 test failure | CRITICAL |
-| **`Bit 6`** | `FLAG_WATCHDOG_CSS_FAIL`| Window Watchdog violation or HSE Crystal fail | CRITICAL |
-| **`Bit 7`** | `FLAG_HW_BREAK_TRIP` | Hardware Comparator triggered `BKIN` | CRITICAL |
-| **`Bit 8`** | `FLAG_BMS_CAN_LOST` | CAN telemetry from external BMS timed out | WARNING |
-| **`Bits 9–15`**| `RESERVED` | Reserved for future expansion | N/A |

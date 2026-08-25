@@ -5,7 +5,9 @@
 
 ---
 
-## 1. Target Microcontroller Memory Architectures
+## 1. Single Source of Truth: Memory Geometry & Bootloader Concepts
+
+This document is the authoritative **Single Source of Truth** for Flash memory partitioning, slot geometries, power-loss-safe metadata formats, confirmed boot sequences, and public key management.
 
 ```
 +===================================================================================================+
@@ -43,21 +45,42 @@
             | Pages 128 - 227 (200 KB): Application Slot B          |
             |                           (Symmetric Staging/Active)  |
             | Pages 228 - 243 (32 KB) : Diagnostic & Fault Event Log|
-            | Pages 244 - 255 (24 KB) : Bootloader Metadata Table   |
+            | Pages 244 - 255 (24 KB) : Power-Loss Safe Metadata    |
 0x0808_0000 +-------------------------------------------------------+
 ```
 
-* **Slot Symmetry:** Application Slot A ($200\text{ KB}$, 100 pages) and Application Slot B ($200\text{ KB}$, 100 pages) have **identical capacity**, guaranteeing any binary that runs in Slot A fits perfectly into Slot B.
+* **Slot Symmetry Invariant:** $\text{Slot\_A\_Capacity} = \text{Slot\_B\_Capacity} = 200\text{ KB}$ ($100\text{ pages} \times 2\text{ KB/page} = 204,800\text{ bytes}$).
 
 ---
 
-## 3. Fixed Bootloader Architecture & Metadata Table
+## 3. Power-Loss Safe Metadata Record Structure
 
-The immutable Secure Bootloader occupies physical base address `0x0800_0000` ($32\text{ KB}$). Upon every reset, the Bootloader executes before any application code:
+To prevent metadata corruption during mid-write brownouts, the metadata table uses an atomic double-buffered commit record:
+
+```c
+typedef struct {
+    uint32_t record_magic;       /* 0x42455353 ("BESS") */
+    uint32_t sequence_num;       /* Monotonically increasing record sequence */
+    uint32_t active_slot;        /* 0: Slot A, 1: Slot B */
+    uint32_t slot_state;         /* EMPTY, STAGED, VALIDATED, TESTING, CONFIRMED, INVALID */
+    uint32_t security_version;   /* Monotonic anti-rollback security version */
+    uint32_t boot_attempts;      /* Boot retry counter for rollback (0 to 3) */
+    uint32_t image_size_bytes;   /* Image payload byte length */
+    uint32_t image_crc32;        /* Golden CRC-32 of active image */
+    uint8_t  sha256_digest[32];  /* SHA-256 digest */
+    uint8_t  ecdsa_signature[64];/* ECDSA secp256r1 signature (R, S) */
+    uint32_t commit_marker;      /* 0xAA55AA55 written ONLY after full record commit */
+    uint32_t header_crc32;       /* CRC-32 over entire metadata record */
+} __attribute__((packed)) BootMetadataRecord_t;
+```
+
+---
+
+## 4. Confirmed Boot Sequence & Automatic Rollback
 
 ```
-                         BOOTLOADER EXECUTION FLOW
-
+                         CONFIRMED BOOT STATE MACHINE
+                         
             +-------------------------------------------------------+
             |                   POWER-ON RESET                      |
             +-------------------------------------------------------+
@@ -65,8 +88,7 @@ The immutable Secure Bootloader occupies physical base address `0x0800_0000` ($3
                                         v
             +-------------------------------------------------------+
             |               BOOTLOADER INITIALIZATION               |
-            |  - Hardware Clock Setup (HSI 16 MHz)                  |
-            |  - Read Shared Metadata Table from Bank 2 (Page 244)  |
+            |  - Read & Validate Active Metadata Record             |
             +-------------------------------------------------------+
                                         |
                                         v
@@ -81,10 +103,10 @@ The immutable Secure Bootloader occupies physical base address `0x0800_0000` ($3
           [YES]        [NO]                    | VERIFY SLOT DIGEST |
           /              \                     +--------------------+
          v                v                             |
-  +--------------+  +-------------------+          [ CRC / SHA OK? ]
+  +--------------+  +-------------------+          [ Digest OK? ]
   | MARK INVALID |  | INCREMENT COUNT   |              /         \
-  | FALLBACK TO  |  | JUMP TO TESTING   |           [YES]       [NO]
-  | PREV CONFIRM |  | SLOT              |            /             \
+  | ROLLBACK TO  |  | JUMP TO TESTING   |           [YES]       [NO]
+  | PREV CONFIRM |  | IMAGE             |            /             \
   +--------------+  +-------------------+           v               v
                                             +---------------+ +--------------+
                                             | JUMP TO MAIN  | | ENTER SAFE   |
@@ -92,26 +114,17 @@ The immutable Secure Bootloader occupies physical base address `0x0800_0000` ($3
                                             +---------------+ +--------------+
 ```
 
-### 3.1 Slot Lifecycle State Machine
-Each slot progresses through explicit states in the Flash Metadata Table:
-
-$$\text{SLOT\_EMPTY} \longrightarrow \text{SLOT\_STAGED} \longrightarrow \text{SLOT\_VALIDATED} \longrightarrow \text{SLOT\_TESTING} \longrightarrow \text{SLOT\_CONFIRMED}$$
-$$\text{or} \longrightarrow \text{SLOT\_INVALID}$$
-
-* **Failure Policy:** If cryptographic verification or CRC fails on a staging image, the bootloader **does not erase Slot B**. It marks `Slot_State = SLOT_INVALID` and records the diagnostic error code in the metadata log for remote SCADA inspection.
-* **Confirmed Boot & Automatic Rollback:**
-  - When a new image boots for the first time, its state is marked `SLOT_TESTING` and `Boot_Attempts = 1`.
-  - If the application starts successfully and initializes all safety diagnostics, it sends an IPC confirmation to mark `Slot_State = SLOT_CONFIRMED` and `Boot_Attempts = 0`.
-  - If the system crashes or watchdog resets before confirmation, `Boot_Attempts` increments on next boot. Upon reaching `Boot_Attempts >= 3`, the bootloader marks the slot `SLOT_INVALID` and rolls back to the previous confirmed slot.
+### 4.1 Step-by-Step Confirmed Boot Sequence
+1. Staged image verified in RAM: SHA-256 + ECDSA secp256r1 signature verified against immutable on-chip public key.
+2. Metadata updated: `Slot_State = SLOT_TESTING`, `Boot_Attempts = 1`.
+3. Application boots and executes IEC 60730 Pre-Execution CPU/RAM self-tests and hardware safety initialization.
+4. If self-tests pass: Application sends IPC confirmation $\to$ Metadata updated to `Slot_State = SLOT_CONFIRMED` and `Boot_Attempts = 0`.
+5. If crash or watchdog trip occurs before confirmation: System reboots. Bootloader reads `Slot_State == TESTING` and increments `Boot_Attempts`.
+6. Upon `Boot_Attempts >= 3`: Bootloader marks `Slot_State = SLOT_INVALID`, rolls back to the previous confirmed slot, and logs diagnostic alarm.
 
 ---
 
-## 4. Cryptographic Authentication & Public Key Management
+## 5. Cryptographic Key Management
 
-* **Authentication Standard:** Firmware binaries are signed using **ECDSA with NIST P-256 (secp256r1) curve and SHA-256 hash**.
-* **Key Storage Policy:**
-  - The device Flash contains **ONLY the Public Verification Key** in the dedicated write-protected Key Region (Bank 1, Pages 124–127).
-  - Private signing keys are **NEVER stored on the microcontroller** and reside exclusively in secure CI/CD hardware security modules (HSM).
-* **Anti-Rollback Version Rule:**
-  $$\text{Image\_Security\_Version} \ge \text{NVRAM\_Monotonic\_Counter}$$
-  Images with lower security counters are rejected immediately.
+* **Public Verification Key Only:** The MCU Flash stores **ONLY the public verification key** in the write-protected Key Region (Pages 124–127).
+* **Zero Private Key Storage:** Private signing keys are **never stored on the microcontroller** and reside solely in secure CI/CD build environments.

@@ -5,9 +5,9 @@
 
 ---
 
-## 1. IPC Physical & Master-Slave Transport Model
+## 1. Single Source of Truth: IPC Architecture & Master-Slave Model
 
-The Gateway MCU (ESP32) acts as the **SPI Master**, and the Control MCU (STM32) acts as the **SPI Slave**.
+This document is the authoritative **Single Source of Truth** for the SPI DMA physical transport, frame serialization format, ARQ error control, transaction idempotency, sequence number handling, and FreeRTOS task isolation.
 
 ```
 +===================================================================================================+
@@ -60,127 +60,42 @@ All packets conform to a fixed header with variable payload length and trailing 
 | :--- | :--- | :--- | :--- | :--- |
 | **0 – 1** | `SYNC_WORD` | `uint16_t` | `0xA55A` | Constant synchronization preamble for byte alignment. |
 | **2** | `PROTO_VER` | `uint8_t` | `0x01` | Protocol major version. |
-| **3** | `SEQ_NUM` | `uint8_t` | $0 - 255$ | Monotonic sequence number. Incremented per unique packet. |
+| **3** | `SEQ_NUM` | `uint8_t` | $0 - 255$ | Monotonic sequence counter with wraparound. |
 | **4** | `MSG_TYPE` | `uint8_t` | Enum | Defines payload schema and priority. |
 | **5** | `MSG_FLAGS` | `uint8_t` | Bitmask | Control flags: `BIT0=ACK`, `BIT1=NACK`, `BIT2=RETRY`, `BIT3=URGENT`. |
 | **6** | `PAYLOAD_LEN` | `uint8_t` | $0 - 64$ | Length $N$ of active payload data in bytes. |
 | **7 .. (7+N-1)**| `PAYLOAD` | `uint8_t[N]`| Binary Data | Serialized data structure. |
 | **(7+N) .. (8+N)**|`CRC16` | `uint16_t` | `0x0000-0xFFFF` | CRC-16-CCITT (`0x1021`, init `0xFFFF`) calculated over bytes $2 \dots (6+N)$. |
 
-### 2.2 Message Types (`MSG_TYPE`)
+---
 
-| Type ID | Enum Identifier | Direction | Description |
-| :--- | :--- | :--- | :--- |
-| **`0x01`** | `MSG_TELEMETRY_FAST` | STM32 $\to$ ESP32 | High-speed feedback: $V_{bus}, I_L, V_{bat}$, State, Flags ($50\text{ Hz}$). |
-| **`0x02`** | `MSG_TELEMETRY_SLOW` | STM32 $\to$ ESP32 | Diagnostics: Temp, DWT cycle jitter, March C- status ($10\text{ Hz}$). |
-| **`0x10`** | `MSG_CMD_SET_STATE` | ESP32 $\to$ STM32 | Supervisory command: Stop / Charge / Discharge. |
-| **`0x11`** | `MSG_CMD_SET_CURRENT` | ESP32 $\to$ STM32 | Setpoint current target: $I_{ref}$ target in $\text{mA}$. |
-| **`0x20`** | `MSG_FAULT_ALERT` | STM32 $\to$ ESP32 | Asynchronous high-priority fault trip notification (via `ALERT_OUT`). |
-| **`0x21`** | `MSG_FAULT_CLEAR` | ESP32 $\to$ STM32 | Authenticated clear command (`0x00A5`). |
-| **`0xFE`** | `MSG_PING` | Bi-directional | Heartbeat link integrity check packet. |
-| **`0xFF`** | `MSG_ACK_NACK` | Bi-directional | Explicit confirmation of received frame sequence number. |
+## 3. Transaction Idempotency & Sequence Number Handling
+
+### 3.1 Duplicate-Command Filtering
+To prevent repeated execution of critical commands (such as Start Charge or Start Discharge) due to lost ACK retransmissions:
+1. The STM32 maintains `last_processed_seq_num` and `last_cached_cmd_result`.
+2. When an incoming command packet arrives with `SEQ_NUM == last_processed_seq_num`, the STM32 **does not re-execute the command**.
+3. It immediately returns an ACK frame containing the cached `last_cached_cmd_result`.
+
+### 3.2 Sequence Number Wraparound
+* The `SEQ_NUM` increments monotonically from $0 \to 255 \to 0$ ($0\text{xFF} \to 0\text{x00}$).
+* Acceptance Window: A packet is considered valid and new if:
+  $$\Delta_{\text{seq}} = (\text{SEQ\_NUM}_{\text{new}} - \text{last\_processed\_seq\_num}) \pmod{256} \in [1, 127]$$
 
 ---
 
-## 3. Protocol State Machine & Automatic Repeat Request (ARQ)
+## 4. Communication Loss Fail-Safe Policy
 
-```
-                            IPC PROTOCOL STATE MACHINE
-
-            +-------------------------------------------------------+
-            |                      IPC_UNINIT                       |
-            |  - Hardware reset; DMA registers cleared              |
-            +-------------------------------------------------------+
-                                        |
-                          [ Peripheral Init Completed ]
-                                        v
-            +-------------------------------------------------------+
-            |                      IPC_SYNCING                      |
-            |  - ESP32 sends periodic MSG_PING (100 ms interval)    |
-            |  - STM32 scans DMA buffer for SYNC_WORD (0xA55A)      |
-            +-------------------------------------------------------+
-                                        |
-                         [ 3 Consecutive Valid Pings ACKed ]
-                                        v
-            +-------------------------------------------------------+
-    +-----> |                  IPC_CONNECTED_IDLE                   |
-    |       |  - Heartbeat timer active (100 ms timeout)            |
-    |       +-------------------------------------------------------+
-    |                                   |
-    |                 [ ALERT_OUT HIGH or Outgoing Cmd Ready ]
-    |                                   v
-    |       +-------------------------------------------------------+
-    |       |                   IPC_TX_RX_ACTIVE                    |
-    |       |  - Full-Duplex DMA Transfer Executed (SPI @ 10 MHz)   |
-    |       +-------------------------------------------------------+
-    |                                   |
-    |                         [ DMA Transfer Complete ]
-    |                                   v
-    |       +-------------------------------------------------------+
-    |       |                     IPC_WAIT_ACK                      |
-    |       |  - Start ACK Timer (Timeout = 5.0 ms)                 |
-    |       +-------------------------------------------------------+
-    |                 |                                   |
-    |        [ ACK Received Valid ]               [ Timeout / NACK ]
-    |                 |                                   |
-    +-----------------+                      [ Retry Count < 3 ]  [ Retry Count >= 3 ]
-                                                     |                      |
-                                            (Send with RETRY Flag)          v
-                                                     |         +-------------------------+
-                                                     +-------> | IPC_COMM_FAULT_DEGRADED |
-                                                               | - Emergency Ramp (100A/s|
-                                                               | - Latch COMM_LOST Flag  |
-                                                               +-------------------------+
-```
-
-### 3.1 Timing & Retry Policy
-* **Acknowledgement Timeout ($T_{ack}$):** $5.0\text{ ms}$.
-* **Maximum ARQ Retries ($N_{retry}$):** $3$ attempts.
-* **Degraded Transition Policy:** If 3 consecutive retransmissions fail, both microcontrollers transition their IPC state machine to `IPC_COMM_FAULT_DEGRADED`. The Control MCU initiates an emergency current ramp-down at $100\text{ A/s}$ to `STATE_IDLE`.
+If SPI DMA communication is lost (no valid frames received for $> 500\text{ ms}$):
+* In `STATE_CHARGE_ACTIVE` or `STATE_DISCHARGE_ACTIVE`: STM32 autonomously initiates an **emergency software ramp-down at $100\text{ A/s}$** ($50\text{ ms}$ to $0\text{ A}$), disables PWM outputs, and enters `STATE_IDLE`.
+* In `STATE_IDLE`: STM32 inhibits transition to charge/discharge until communication is re-synchronized.
 
 ---
 
-## 4. FreeRTOS Non-Blocking Gateway Architecture
+## 5. FreeRTOS Non-Blocking Gateway Architecture
 
-```
-+===================================================================================================+
-|                                    GATEWAY FREERTOS ARCHITECTURE                                  |
-|                                                                                                   |
-|  Priority 5 [High / Real-Time]                                                                    |
-|  +---------------------------------------------------------------------------------------------+  |
-|  | IPC Master Task: Handles SPI DMA transfers, parses CRC, posts to ring buffers               |  |
-|  | Queue Length: IPC_TX_QUEUE_LEN = 16, IPC_RX_QUEUE_LEN = 16                                   |  |
-|  | Timeout: Strict pdMS_TO_TICKS(10); High-Water Mark: > 512 bytes                              |  |
-|  +---------------------------------------------------------------------------------------------+  |
-|                                  |                         ^                                      |
-|                                  v                         |                                      |
-|  Priority 3 [Medium]                                                                              |
-|  +---------------------------------------------------------------------------------------------+  |
-|  | CAN BMS Ingestion Task: Ingests pack telemetry @ 100 ms; computes dynamic charge limits     |  |
-|  | Queue: CAN_RX_QUEUE_LEN = 32; Non-blocking xQueueSend(timeout = 0)                         |  |
-|  +---------------------------------------------------------------------------------------------+  |
-|                                  |                         |                                      |
-|                                  v                         v                                      |
-|  Priority 2 [Normal]                                                                              |
-|  +---------------------------------------------------------------------------------------------+  |
-|  | Modbus Server Task: Serves SCADA registers 40001-40018; enforces setpoint validation        |  |
-|  +---------------------------------------------------------------------------------------------+  |
-|                                  |                                                                |
-|                                  v                                                                |
-|  Priority 1 [Low / Telemetry]                                                                     |
-|  +---------------------------------------------------------------------------------------------+  |
-|  | MQTT Publisher Task: JSON cloud telemetry @ 1 Hz. Drops frames on socket stall (No blocking)|  |
-|  +---------------------------------------------------------------------------------------------+  |
-+===================================================================================================+
-```
-
-### 4.1 FreeRTOS Non-Blocking Safety Mechanisms
-1. **Bounded Queues & Zero-Wait Backpressure:**
-   ```c
-   if (xQueueSend(g_mqtt_telemetry_queue, &telemetry_item, 0) != pdPASS) {
-       /* Queue full due to network delay: drop frame and log diagnostic counter */
-       g_network_dropped_frames_count++;
-   }
-   ```
-2. **Task Watchdog Timer (TWDT):** All tasks register with the hardware TWDT ($500\text{ ms}$ timeout).
-3. **Stack Monitoring:** `uxTaskGetStackHighWaterMark()` reported over diagnostics.
+* **Task 1: IPC Master Task (`Priority 5` - High / Real-Time):** Non-blocking queues (`IPC_TX_QUEUE_LEN = 16`, `IPC_RX_QUEUE_LEN = 16`), timeout `pdMS_TO_TICKS(10)`.
+* **Task 2: CAN BMS Ingestion (`Priority 3` - Medium):** Ingests pack telemetry @ $100\text{ ms}$.
+* **Task 3: Modbus Server (`Priority 2` - Normal):** Serves SCADA registers $40001 - 40018$.
+* **Task 4: MQTT Cloud Telemetry (`Priority 1` - Low):** JSON telemetry @ $1\text{ Hz}$. Drops frames on backpressure without stalling IPC.
+* **Watchdogs & Stacks:** Task Watchdog Timer ($500\text{ ms}$ timeout) and `uxTaskGetStackHighWaterMark()` monitoring.
