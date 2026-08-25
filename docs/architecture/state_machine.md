@@ -5,9 +5,12 @@
 
 ---
 
-## 1. State Machine Overview
+## 1. Unified Control Loop & Supervisory Timing Hierarchy
 
-The Control MCU firmware executes a strictly deterministic Finite State Machine (FSM) synchronized with the $50\text{ kHz}$ inner control interrupt and the $1\text{ kHz}$ system supervisory tick. All transitions between states are guarded by explicit boundary checks and mathematical plausibility constraints.
+The Control MCU firmware executes a hierarchical timing architecture:
+1. **$50.0\text{ kHz}$ Fast Inner Loop ($T_s = 20.0\,\mu\text{s}$):** Synchronous current sampling, cycle-by-cycle PID execution, anti-windup clamping, and PWM register updates.
+2. **$5.0\text{ kHz}$ Slow Outer Loop ($T_s = 200.0\,\mu\text{s}$):** Voltage loop regulation generating dynamic current setpoint $I_{ref}$.
+3. **$1.0\text{ kHz}$ Supervisory FSM Loop ($T_s = 1.0\text{ ms}$):** Finite state machine transitions, normal current ramping ($2.0\text{ mA/ms} = 2.0\text{ A/s}$), emergency current ramp-down ($100\text{ mA/ms} = 100.0\text{ A/s}$), and diagnostic checks.
 
 ```
 +===================================================================================================+
@@ -38,11 +41,10 @@ The Control MCU firmware executes a strictly deterministic Finite State Machine 
 |        |                v                v                      |                                 |
 |        |      +------------------+  +--------------------+      |                                 |
 |        |      |STATE_CHARGE_RAMP |  |STATE_DISCHARGE_RAMP|      |                                 |
-|        |      | - Pre-check Vbus |  | - Pre-check Vbat   |      |                                 |
-|        |      | - Ramp I_ref up  |  | - Ramp I_ref up    |      |                                 |
+|        |      | (2.0 A/s Ramp)   |  | (2.0 A/s Ramp)     |      |                                 |
 |        |      +------------------+  +--------------------+      |                                 |
 |        |                |                    |                  |                                 |
-|        |         [ Ramp Target Met ]  [ Ramp Target Met ]       |                                 |
+|        |         [ Target Current Met] [ Target Current Met]    |                                 |
 |        |                v                    v                  |                                 |
 |        |      +------------------+  +--------------------+      |                                 |
 |        |      |STATE_CHARGE_ACTIV|  |STATE_DISCHARGE_ACT |      |                                 |
@@ -61,11 +63,11 @@ The Control MCU firmware executes a strictly deterministic Finite State Machine 
 |        |          [ Temp / SOC Normal Again ]                   |                                 |
 |        +------------------------+                               |                                 |
 |                                                                 |                                 |
-|  [ Level 2 Fault / Stop Cmd / Normal Shutdown ]                 |                                 |
-|  - Controlled Current Ramp-Down (dI/dt <= 2.0 A/s)              |                                 |
-|  - Disable PWM Software Output -> Returns to STATE_IDLE         |                                 |
+|  [ Level 2 Fault / Emergency Stop: Ramp-Down at 100 A/s ]       |                                 |
+|  +------------------------------------------------------+       |                                 |
+|  | Decelerates to 0A in <= 50 ms, disables PWM -> IDLE  |       |                                 |
 |                                                                 |                                 |
-|  [ Tier-0 Critical Hardware Fault (Over-Current / Over-Voltage / IEC Failure) ]                  |
+|  [ Level 3 Critical Hardware Fault (Tier-0 Break Trip <= 2.0 us) ]                                |
 |  +--------------------------------------------------------------+                                 |
 |  |                                                                                                |
 |  v                                                                                                |
@@ -74,123 +76,78 @@ The Control MCU firmware executes a strictly deterministic Finite State Machine 
 |  |  - Hardware Timer Break Asserted (PWM forced LOW in <= 2.0 us)                              |  |
 |  |  - Isolation Relay Contacts Commanded OPEN                                                  |  |
 |  |  - Fault Code Latched in Register 40010; SCADA Alert Broadcast                              |  |
-|  |  - Microcontroller Lockout until hard power cycle or authenticated clear command            |  |
 |  +=============================================================================================+  |
+|                                                 |                                                 |
+|                                [ Write 0x00A5 to Register 40014 ]                                 |
+|                                                 v                                                 |
+|                               +------------------------------------+                              |
+|                               |        STATE_RECOVERY_CHECK        |                              |
+|                               |  - Verify sensors within band      |                              |
+|                               |  - Verify hardware break cleared   |                              |
+|                               +------------------------------------+                              |
+|                                                 |                                                 |
+|                                    [ Verification Passed ]                                        |
+|                                                 v                                                 |
+|                                            STATE_IDLE                                             |
+|                             (Requires new START command to run)                                   |
 +===================================================================================================+
 ```
 
 ---
 
-## 2. Detailed State Table & Actions
+## 2. Detailed State Descriptions & Transition Guard Conditions
 
 ### 2.1 State 0: `STATE_POWER_ON`
-* **Entry:** Microcontroller power applied or hardware reset line released.
-* **Actions:**
-  - Setup core clock trees (HSE $8\text{ MHz} \to \text{PLL} \to 168/170\text{ MHz}$).
-  - Remap interrupt vector table to active Flash base address.
-  - Initialize basic internal GPIO pins to safe default states.
-* **Exit Criteria:** Unconditional transition to `STATE_INIT_AND_SELF_TEST`.
-
----
+* **Entry:** Microcontroller reset vector execution.
+* **Actions:** Clock configuration (HSE $8\text{ MHz} \to \text{PLL} \to 170\text{ MHz}$), vector table relocation.
+* **Exit:** Unconditional transition to `STATE_INIT_AND_SELF_TEST`.
 
 ### 2.2 State 1: `STATE_INIT_AND_SELF_TEST`
-* **Entry:** Boot initialization complete.
 * **Actions:**
-  - Execute destructive CPU core register pattern tests (`0x55555555` / `0xAAAAAAAA`).
-  - Execute destructive startup SRAM March C- scan.
-  - Calculate active application Flash CRC-32 and match against image golden header.
-  - Configure TIM1/HRTIM complementary PWM outputs with hardware dead-time ($350\text{ ns}$).
-  - Configure internal/external analog comparators and map to `BKIN` break inputs.
-  - Perform multi-point ADC zero-offset self-calibration.
-* **Exit Criteria:**
-  - **Pass:** All self-tests return `SUCCESS` $\to$ Transition to `STATE_IDLE`.
-  - **Fail:** Any diagnostic error $\to$ Latch `FLT_IEC_*` fault code and transition to `STATE_SAFE_STATE`.
-
----
+  - IEC 60730 CPU register pattern tests (R0-R12, SP, LR, APSR flags).
+  - Destructive SRAM March C- scan on unallocated memory.
+  - Flash CRC-32 golden signature validation.
+  - HRTIM/TIM1 dead-time and internal analog comparator configuration.
+* **Exit:**
+  - **Pass:** Transitions to `STATE_IDLE`.
+  - **Fail:** Latches fault and transitions to `STATE_SAFE_STATE`.
 
 ### 2.3 State 2: `STATE_IDLE`
-* **Entry:** Successful initialization, normal soft-stop completion, or cleared soft fault.
 * **Actions:**
-  - PWM outputs forced to High-Z / Inactive LOW.
-  - Continuous execution of non-destructive sliced March C- SRAM check ($\le 100\text{ ms}$ interval).
-  - Refresh Window Watchdog (IWDG) every $50\text{ ms} \pm 10\text{ ms}$.
-  - Monitor DC bus and battery voltages to ensure stability.
-* **Exit Criteria:**
-  - Command `SYS_CONTROL_CMD == 1` AND $18.0\text{ V} \le V_{bus} \le 24.5\text{ V}$ $\to$ Transition to `STATE_CHARGE_RAMP`.
-  - Command `SYS_CONTROL_CMD == 2` AND $V_{bat} \ge 10.5\text{ V}$ $\to$ Transition to `STATE_DISCHARGE_RAMP`.
-  - Any Critical Hardware Trip $\to$ Transition to `STATE_SAFE_STATE`.
+  - PWM outputs inactive High-Z; power relays open.
+  - Sliced runtime March C- SRAM testing ($\le 100\text{ ms}$ window).
+  - Refresh IWDG ($50\text{ ms} \pm 10\text{ ms}$).
+* **Exit:**
+  - `SYS_CONTROL_CMD == 1` (Start Charge) AND $18.0\text{ V} \le V_{bus} \le 24.5\text{ V}$ $\to$ `STATE_CHARGE_RAMP`.
+  - `SYS_CONTROL_CMD == 2` (Start Discharge) AND $V_{bat} \ge 10.5\text{ V}$ $\to$ `STATE_DISCHARGE_RAMP`.
+  - Level 3 Critical Fault $\to$ `STATE_SAFE_STATE`.
 
----
+### 2.4 State 3: `STATE_CHARGE_RAMP` & State 5: `STATE_DISCHARGE_RAMP`
+* **Ramping Rate:** $2.0\text{ A/s}$ ($2.0\text{ mA}$ increment per $1.0\text{ ms}$ supervisory tick).
+* **Exit:** Target current reached $\to$ `STATE_CHARGE_ACTIVE` / `STATE_DISCHARGE_ACTIVE`.
 
-### 2.4 State 3: `STATE_CHARGE_RAMP`
-* **Entry:** Charge command received in `STATE_IDLE`.
+### 2.5 State 4: `STATE_CHARGE_ACTIVE` & State 6: `STATE_DISCHARGE_ACTIVE`
+* **Actions:** Dual-loop cascaded PID executing at $50\text{ kHz}$ inner / $5\text{ kHz}$ outer.
+* **Exit:**
+  - Thermal / SOC Warning $\to$ `STATE_DERATING_ACTIVE`.
+  - Stop Command / Level 2 Fault $\to$ Emergency ramp-down ($100\text{ A/s}$) to `STATE_IDLE`.
+  - Level 3 Critical Fault $\to$ Instant Tier-0 Break Trip to `STATE_SAFE_STATE`.
+
+### 2.6 State 7: `STATE_DERATING_ACTIVE`
+* **Actions:** Clamps active current setpoint $I_{ref}$ to derated envelope ($20\% - 50\%$ nominal).
+* **Exit:** Temperature $< 50^\circ\text{C}$ for $> 5.0\text{ s}$ $\to$ Returns to Active State.
+
+### 2.7 State 8: `STATE_SAFE_STATE`
+* **Actions:** Hardware Break forces PWM `LOW` $\le 2.0\,\mu\text{s}$. Latches `FAULT_CODE` in register `40010`.
+* **Exit:** Receives authenticated fault clear command `FAULT_CLEAR_CMD = 0x00A5` $\to$ Transitions to `STATE_RECOVERY_CHECK`.
+
+### 2.8 State 9: `STATE_RECOVERY_CHECK`
+* **Entry:** Fault clear request received in `STATE_SAFE_STATE`.
 * **Actions:**
-  - Enable High-Side Buck complementary PWM switching.
-  - Ramp current reference setpoint $I_{ref}$ from $0.0\text{ A}$ to target setpoint (e.g. $+2.5\text{ A}$) at a rate of $dI/dt = 2.0\text{ A/s}$ ($1.0\text{ mA}$ per $500\,\mu\text{s}$ tick).
-  - Monitor for initial inrush transients or switch ringing.
-* **Exit Criteria:**
-  - Target current reached ($|I_{actual} - I_{target}| \le 0.1\text{ A}$) $\to$ Transition to `STATE_CHARGE_ACTIVE`.
-  - Ramp timeout ($> 3.0\text{ s}$) or soft fault $\to$ Ramp down to `STATE_IDLE`.
-  - Critical fault $\to$ Transition to `STATE_SAFE_STATE`.
-
----
-
-### 2.5 State 4: `STATE_CHARGE_ACTIVE`
-* **Entry:** Charge ramp successfully completed.
-* **Actions:**
-  - Execute cascaded dual-loop PID in Buck mode ($50\text{ kHz}$ inner current loop, $5\text{ kHz}$ outer voltage loop).
-  - Continuous CC-CV regulation (Constant Current charging up to $14.4\text{ V}$, Constant Voltage taper).
-  - Stream fast telemetry frames over SPI DMA every $20\text{ ms}$.
-* **Exit Criteria:**
-  - Heatsink temp $55^\circ\text{C} \le T \le 65^\circ\text{C}$ $\to$ Transition to `STATE_DERATING_ACTIVE`.
-  - Battery full ($V_{bat} \ge 14.4\text{ V}$ and $I < 0.2\text{ A}$) or Stop Command received $\to$ Execute soft ramp-down to `STATE_IDLE`.
-  - Level 2 Soft Fault $\to$ Soft ramp-down to `STATE_IDLE`.
-  - Level 3 Critical Fault $\to$ Transition to `STATE_SAFE_STATE`.
-
----
-
-### 2.6 State 5: `STATE_DISCHARGE_RAMP`
-* **Entry:** Discharge command received in `STATE_IDLE`.
-* **Actions:**
-  - Enable Low-Side Boost complementary PWM switching.
-  - Ramp discharge current setpoint from $0.0\text{ A}$ to target negative current (e.g. $-2.5\text{ A}$) at $dI/dt = 2.0\text{ A/s}$.
-* **Exit Criteria:**
-  - Target discharge current reached $\to$ Transition to `STATE_DISCHARGE_ACTIVE`.
-  - Ramp timeout or soft fault $\to$ Ramp down to `STATE_IDLE`.
-  - Critical fault $\to$ Transition to `STATE_SAFE_STATE`.
-
----
-
-### 2.7 State 6: `STATE_DISCHARGE_ACTIVE`
-* **Entry:** Discharge ramp successfully completed.
-* **Actions:**
-  - Execute cascaded dual-loop PID in Boost mode supplying power to the DC bus load.
-  - Regulate bus voltage ($24.0\text{ V}$) while clamping maximum discharge current.
-* **Exit Criteria:**
-  - Warning condition (Low SOC $10-15\%$ or Temp $55-65^\circ\text{C}$) $\to$ Transition to `STATE_DERATING_ACTIVE`.
-  - Battery empty ($V_{bat} \le 10.0\text{ V}$) or Stop Command received $\to$ Soft ramp-down to `STATE_IDLE`.
-  - Critical fault $\to$ Transition to `STATE_SAFE_STATE`.
-
----
-
-### 2.8 State 7: `STATE_DERATING_ACTIVE`
-* **Entry:** Thermal warning ($55^\circ\text{C} \le T \le 65^\circ\text{C}$) or low battery state of charge.
-* **Actions:**
-  - Apply linear current derating factor $K_{derate} \in [0.2, 0.8]$ to the PID reference setpoint $I_{ref}$.
-  - Assert warning flag `FLT_TEMP_WARN` / `FLT_SOC_LOW` in register `40005`.
-* **Exit Criteria:**
-  - Temperature drops $< 50^\circ\text{C}$ for $> 5.0\text{ s}$ $\to$ Return to active operating state (`CHARGE_ACTIVE` or `DISCHARGE_ACTIVE`).
-  - Temperature exceeds $65.0^\circ\text{C}$ $\to$ Soft ramp-down to `STATE_IDLE`.
-  - Critical fault $\to$ Transition to `STATE_SAFE_STATE`.
-
----
-
-### 2.9 State 8: `STATE_SAFE_STATE`
-* **Entry:** Hardware Over-Current ($I > 5.0\text{ A}$), Hardware Over-Voltage ($V > 26.0\text{ V}$), Watchdog failure, or IEC 60730 self-test failure.
-* **Actions:**
-  - Hardware Break circuit drives all PWM outputs `LOW` within $\le 2.0\,\mu\text{s}$.
-  - Main power relays opened.
-  - Latches active fault code in Modbus register `40010`.
-  - LED fault blink code output active.
-* **Exit Criteria:**
-  - Requires physical power-cycle or authenticated supervisory reset command `SYS_CONTROL_CMD = 0xFF` after diagnostic verification.
+  - Confirms DC bus voltage is within safe band ($16.0\text{ V} \le V_{bus} \le 25.0\text{ V}$).
+  - Confirms inductor current is quiescent ($|I_L| < 0.2\text{ A}$).
+  - Confirms temperature has normalized ($T < 45^\circ\text{C}$).
+  - Re-arms hardware Timer Break inputs (`HRTIM_CR2_SWFLTR` / `TIM_BDTR_MOE`).
+* **Exit:**
+  - If all checks pass $\to$ Transitions to `STATE_IDLE`. (Power conversion remains STOPPED until a new explicit `START` command is issued).
+  - If any check fails $\to$ Re-latches fault and returns to `STATE_SAFE_STATE`.

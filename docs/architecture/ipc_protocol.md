@@ -5,9 +5,9 @@
 
 ---
 
-## 1. IPC Physical & Transport Layer
+## 1. IPC Physical & Master-Slave Transport Model
 
-The Control MCU (STM32) and Gateway MCU (ESP32) are interconnected via a high-speed, full-duplex SPI bus backed by hardware DMA channels and an asynchronous hardware Alert/Interrupt line.
+The Gateway MCU (ESP32) acts as the **SPI Master**, and the Control MCU (STM32) acts as the **SPI Slave**.
 
 ```
 +===================================================================================================+
@@ -15,23 +15,26 @@ The Control MCU (STM32) and Gateway MCU (ESP32) are interconnected via a high-sp
 |                                                                                                   |
 |  +---------------------------+                             +----------------------------------+   |
 |  | CONTROL MCU (STM32)       |                             | GATEWAY MCU (ESP32)              |   |
+|  | (SPI Slave + DMA)         |                             | (SPI Master + DMA)               |   |
 |  |                           |                             |                                  |   |
-|  |  SPI1_SCK (Slave)  <------+=============================+--- SPI2_CLK (Master, 10 MHz)    |   |
-|  |  SPI1_MISO (Slave Out) ---+============================>+--- SPI2_MISO (Master In)         |   |
-|  |  SPI1_MOSI (Slave In)  <--+=============================+--- SPI2_MOSI (Master Out)        |   |
-|  |  SPI1_NSS (Slave Sel)  <--+=============================+--- SPI2_CS (Chip Select)        |   |
+|  |  SPI1_SCK (Slave Clock)  <+=============================+--- SPI2_CLK (Master Clock, 10MHz)|   |
+|  |  SPI1_MISO (Slave Out)   -+============================>+--- SPI2_MISO (Master In)         |   |
+|  |  SPI1_MOSI (Slave In)    <+=============================+--- SPI2_MOSI (Master Out)        |   |
+|  |  SPI1_NSS (Chip Select)  <+=============================+--- SPI2_CS (Chip Select Active L)|   |
 |  |                           |                             |                                  |   |
-|  |  ALERT_OUT (GPIO PushPull)+============================>+--- ALERT_IN (GPIO Int Falling)   |   |
-|  |  (Hardware Fault/Data Rdy)|                             |    (Triggers Immediate IPC Tx)   |   |
+|  |  ALERT_OUT (Active HIGH) -+============================>+--- ALERT_IN (GPIO Int Rising)    |   |
+|  |  (Held HIGH until ACKed)  |                             |    (Triggers SPI Master Read)    |   |
 |  +---------------------------+                             +----------------------------------+   |
 +===================================================================================================+
 ```
 
-### 1.1 Physical Bus Parameters
-* **SPI Clock Frequency ($f_{sck}$):** $10.0\text{ MHz}$ (Single-byte transfer time: $800\text{ ns}$).
-* **SPI Mode:** Mode 0 (`CPOL = 0`, `CPHA = 0`).
-* **Frame Transfer Rate:** Up to $100\text{ Hz}$ periodic telemetry stream ($10\text{ ms}$ interval), or asynchronous on-demand alert.
-* **DMA Controller:** Multi-buffer circular DMA on STM32 (`DMA1_Channel2/3` or `DMA2_Stream2/3`) and ESP32 DMA Engine.
+### 1.1 Master-Slave Transaction Semantics & ALERT_OUT Line
+* **Physical Constraint:** In standard SPI, slave devices cannot generate clock pulses or initiate transfers autonomously.
+* **Slave Interrupt Signalling:** When the STM32 Control Core has high-priority telemetry ready ($50\text{ Hz}$) or detects an asynchronous fault event:
+  1. The STM32 prepares the outbound frame inside its SPI DMA TX buffer.
+  2. The STM32 asserts the `ALERT_OUT` GPIO line from `LOW` to `HIGH`.
+  3. The `ALERT_OUT` line remains **latched `HIGH`** until the ESP32 performs an SPI transaction that successfully reads and acknowledges the frame.
+* **Master Transaction Clocking:** The ESP32 detects the rising edge on `ALERT_IN` via FreeRTOS GPIO interrupt, which unblocks the high-priority `IPC_Master_Task` to assert `CS` (LOW) and clock out the full-duplex SPI DMA transaction.
 
 ---
 
@@ -59,7 +62,7 @@ All packets conform to a fixed header with variable payload length and trailing 
 | **2** | `PROTO_VER` | `uint8_t` | `0x01` | Protocol major version. |
 | **3** | `SEQ_NUM` | `uint8_t` | $0 - 255$ | Monotonic sequence number. Incremented per unique packet. |
 | **4** | `MSG_TYPE` | `uint8_t` | Enum | Defines payload schema and priority. |
-| **5** | `MSG_FLAGS` | `uint8_t` | Bitmask | Packet control flags: `BIT0=ACK`, `BIT1=NACK`, `BIT2=RETRY`, `BIT3=URGENT`. |
+| **5** | `MSG_FLAGS` | `uint8_t` | Bitmask | Control flags: `BIT0=ACK`, `BIT1=NACK`, `BIT2=RETRY`, `BIT3=URGENT`. |
 | **6** | `PAYLOAD_LEN` | `uint8_t` | $0 - 64$ | Length $N$ of active payload data in bytes. |
 | **7 .. (7+N-1)**| `PAYLOAD` | `uint8_t[N]`| Binary Data | Serialized data structure. |
 | **(7+N) .. (8+N)**|`CRC16` | `uint16_t` | `0x0000-0xFFFF` | CRC-16-CCITT (`0x1021`, init `0xFFFF`) calculated over bytes $2 \dots (6+N)$. |
@@ -70,10 +73,10 @@ All packets conform to a fixed header with variable payload length and trailing 
 | :--- | :--- | :--- | :--- |
 | **`0x01`** | `MSG_TELEMETRY_FAST` | STM32 $\to$ ESP32 | High-speed feedback: $V_{bus}, I_L, V_{bat}$, State, Flags ($50\text{ Hz}$). |
 | **`0x02`** | `MSG_TELEMETRY_SLOW` | STM32 $\to$ ESP32 | Diagnostics: Temp, DWT cycle jitter, March C- status ($10\text{ Hz}$). |
-| **`0x10`** | `MSG_CMD_SET_STATE` | ESP32 $\to$ STM32 | Supervisory command: Transition state machine to Stop/Charge/Discharge. |
-| **`0x11`** | `MSG_CMD_SET_CURRENT` | ESP32 $\to$ STM32 | Setpoint current limit: $I_{ref}$ target in $\text{mA}$. |
-| **`0x20`** | `MSG_FAULT_ALERT` | STM32 $\to$ ESP32 | Asynchronous high-priority fault trip notification. |
-| **`0x21`** | `MSG_FAULT_CLEAR` | ESP32 $\to$ STM32 | Supervisory command to clear latched software faults. |
+| **`0x10`** | `MSG_CMD_SET_STATE` | ESP32 $\to$ STM32 | Supervisory command: Stop / Charge / Discharge. |
+| **`0x11`** | `MSG_CMD_SET_CURRENT` | ESP32 $\to$ STM32 | Setpoint current target: $I_{ref}$ target in $\text{mA}$. |
+| **`0x20`** | `MSG_FAULT_ALERT` | STM32 $\to$ ESP32 | Asynchronous high-priority fault trip notification (via `ALERT_OUT`). |
+| **`0x21`** | `MSG_FAULT_CLEAR` | ESP32 $\to$ STM32 | Authenticated clear command (`0x00A5`). |
 | **`0xFE`** | `MSG_PING` | Bi-directional | Heartbeat link integrity check packet. |
 | **`0xFF`** | `MSG_ACK_NACK` | Bi-directional | Explicit confirmation of received frame sequence number. |
 
@@ -104,18 +107,18 @@ All packets conform to a fixed header with variable payload length and trailing 
     |       |  - Heartbeat timer active (100 ms timeout)            |
     |       +-------------------------------------------------------+
     |                                   |
-    |                         [ Outgoing Message Ready ]
+    |                 [ ALERT_OUT HIGH or Outgoing Cmd Ready ]
     |                                   v
     |       +-------------------------------------------------------+
     |       |                   IPC_TX_RX_ACTIVE                    |
-    |       |  - DMA transfer active over SPI bus                   |
+    |       |  - Full-Duplex DMA Transfer Executed (SPI @ 10 MHz)   |
     |       +-------------------------------------------------------+
     |                                   |
     |                         [ DMA Transfer Complete ]
     |                                   v
     |       +-------------------------------------------------------+
     |       |                     IPC_WAIT_ACK                      |
-    |       |  - Start ACK Timer (Timeout = 10 ms)                  |
+    |       |  - Start ACK Timer (Timeout = 5.0 ms)                 |
     |       +-------------------------------------------------------+
     |                 |                                   |
     |        [ ACK Received Valid ]               [ Timeout / NACK ]
@@ -125,21 +128,19 @@ All packets conform to a fixed header with variable payload length and trailing 
                                             (Send with RETRY Flag)          v
                                                      |         +-------------------------+
                                                      +-------> | IPC_COMM_FAULT_DEGRADED |
-                                                               | - Ramp power to 0A      |
+                                                               | - Emergency Ramp (100A/s|
                                                                | - Latch COMM_LOST Flag  |
                                                                +-------------------------+
 ```
 
 ### 3.1 Timing & Retry Policy
-* **Acknowledgement Timeout ($T_{ack}$):** $10.0\text{ ms}$.
+* **Acknowledgement Timeout ($T_{ack}$):** $5.0\text{ ms}$.
 * **Maximum ARQ Retries ($N_{retry}$):** $3$ attempts.
-* **Degraded Transition Policy:** If 3 consecutive retransmissions fail, both microcontrollers transition their IPC state machine to `IPC_COMM_FAULT_DEGRADED`. The Control MCU initiates a controlled current ramp-down ($dI/dt \le 2.0\text{ A/s}$) to `STATE_IDLE`.
+* **Degraded Transition Policy:** If 3 consecutive retransmissions fail, both microcontrollers transition their IPC state machine to `IPC_COMM_FAULT_DEGRADED`. The Control MCU initiates an emergency current ramp-down at $100\text{ A/s}$ to `STATE_IDLE`.
 
 ---
 
 ## 4. FreeRTOS Non-Blocking Gateway Architecture
-
-To guarantee that slow networking stacks (Modbus-TCP socket retransmission, Wi-Fi reconnection, CAN arbitration) never block high-speed IPC telemetry, the Gateway firmware enforces strict task isolation:
 
 ```
 +===================================================================================================+
@@ -162,7 +163,7 @@ To guarantee that slow networking stacks (Modbus-TCP socket retransmission, Wi-F
 |                                  v                         v                                      |
 |  Priority 2 [Normal]                                                                              |
 |  +---------------------------------------------------------------------------------------------+  |
-|  | Modbus Server Task: Serves SCADA registers 40001-40013; enforces setpoint validation        |  |
+|  | Modbus Server Task: Serves SCADA registers 40001-40018; enforces setpoint validation        |  |
 |  +---------------------------------------------------------------------------------------------+  |
 |                                  |                                                                |
 |                                  v                                                                |
@@ -173,18 +174,13 @@ To guarantee that slow networking stacks (Modbus-TCP socket retransmission, Wi-F
 +===================================================================================================+
 ```
 
-### 4.1 FreeRTOS Safety Mechanisms
+### 4.1 FreeRTOS Non-Blocking Safety Mechanisms
 1. **Bounded Queues & Zero-Wait Backpressure:**
    ```c
-   /* Posting telemetry to MQTT task with ZERO timeout to prevent stalling IPC */
    if (xQueueSend(g_mqtt_telemetry_queue, &telemetry_item, 0) != pdPASS) {
        /* Queue full due to network delay: drop frame and log diagnostic counter */
        g_network_dropped_frames_count++;
    }
    ```
-2. **Task Watchdog Timer (TWDT):**
-   - All FreeRTOS tasks register with the hardware TWDT ($500\text{ ms}$ timeout).
-   - If any task blocks or enters an infinite loop, TWDT triggers a system reset.
-3. **Stack Monitoring via `uxTaskGetStackHighWaterMark()`:**
-   - Diagnostic task inspects remaining stack words for each task every $1.0\text{ s}$.
-   - If `uxTaskGetStackHighWaterMark(task_handle) < 64` ($< 256\text{ bytes}$), a `STACK_OVERFLOW_WARNING` flag is raised in telemetry.
+2. **Task Watchdog Timer (TWDT):** All tasks register with the hardware TWDT ($500\text{ ms}$ timeout).
+3. **Stack Monitoring:** `uxTaskGetStackHighWaterMark()` reported over diagnostics.
