@@ -5,23 +5,19 @@
 
 ---
 
-## 1. Single Source of Truth: Memory Geometry & Bootloader Concepts
+## 1. Single Source of Truth: Memory Geometry & Fixed Bootloader Architecture
 
-This document is the authoritative **Single Source of Truth** for Flash memory partitioning, slot geometries, power-loss-safe metadata formats, confirmed boot sequences, and public key management.
+This document is the authoritative **Single Source of Truth** for Flash memory partitioning, symmetric slot geometries, power-loss-safe metadata formats, confirmed boot sequences, and public key management.
 
 ```
 +===================================================================================================+
-|                                    FLASH ARCHITECTURE COMPARISON                                  |
+|                                    FLASH ARCHITECTURE (FIXED BOOTLOADER)                          |
 |                                                                                                   |
 |  PRIMARY TARGET: STM32G474RE (512 KB Dual-Bank Flash, Symmetric 200 KB App Slots)                 |
-|  - Bank 1 (256 KB, Pages 0-127) + Bank 2 (256 KB, Pages 128-255)                                  |
-|  - Page Size: Uniform 2 KB per page (256 pages total)                                             |
+|  - Bank 1 (256 KB, Pages 0-127, Addr 0x0800_0000) + Bank 2 (256 KB, Pages 0-127, Addr 0x0804_0000)|
+|  - Page Size: Uniform 2 KB per page (256 pages total across two banks)                            |
 |  - Symmetric Dual-Bank Layout: Slot A (200 KB) and Slot B (200 KB)                                |
-|  - True Read-While-Write (RWW) and Zero-Downtime Bank Swapping via BFB2 Option Bit                |
-|                                                                                                   |
-|  SECONDARY / PORTING TARGET: STM32F446RE (512 KB Single-Bank Flash)                               |
-|  - 8 Asymmetric Sectors (4 x 16 KB, 1 x 64 KB, 3 x 128 KB)                                        |
-|  - In-Application Programming (IAP) staging via RAM-buffered sector relocation                   |
+|  - Fixed Base Bootloader: Executes from 0x0800_0000, validates metadata, jumps to active slot     |
 +===================================================================================================+
 ```
 
@@ -33,19 +29,19 @@ This document is the authoritative **Single Source of Truth** for Flash memory p
 
 ```
 0x0800_0000 +-------------------------------------------------------+
-            | BANK 1: PRIMARY BANK (256 KB)                         |
+            | BANK 1: PRIMARY BANK (256 KB - Pages 0 to 127)        |
             |                                                       |
-            | Pages 0 - 15   (32 KB)  : Immutable Secure Bootloader |
+            | Pages 0 - 15   (32 KB)  : Fixed Immutable Bootloader  |
             | Pages 16 - 115 (200 KB) : Application Slot A          |
             | Pages 116 - 123 (16 KB) : NVRAM System Configuration  |
             | Pages 124 - 127 (8 KB)  : Public Key Verification Reg |
 0x0804_0000 +-------------------------------------------------------+
-            | BANK 2: SECONDARY BANK (256 KB)                       |
+            | BANK 2: SECONDARY BANK (256 KB - Pages 0 to 127)      |
             |                                                       |
-            | Pages 128 - 227 (200 KB): Application Slot B          |
+            | Pages 0 - 99   (200 KB) : Application Slot B          |
             |                           (Symmetric Staging/Active)  |
-            | Pages 228 - 243 (32 KB) : Diagnostic & Fault Event Log|
-            | Pages 244 - 255 (24 KB) : Power-Loss Safe Metadata    |
+            | Pages 100 - 115 (32 KB) : Diagnostic & Fault Event Log|
+            | Pages 116 - 127 (24 KB) : Power-Loss Safe Metadata    |
 0x0808_0000 +-------------------------------------------------------+
 ```
 
@@ -69,10 +65,12 @@ typedef struct {
     uint32_t image_crc32;        /* Golden CRC-32 of active image */
     uint8_t  sha256_digest[32];  /* SHA-256 digest */
     uint8_t  ecdsa_signature[64];/* ECDSA secp256r1 signature (R, S) */
-    uint32_t commit_marker;      /* 0xAA55AA55 written ONLY after full record commit */
-    uint32_t header_crc32;       /* CRC-32 over entire metadata record */
+    uint32_t payload_crc32;      /* CRC-32 calculated over bytes 0 to (sizeof - 8) */
+    uint32_t commit_marker;      /* 0xAA55AA55 written LAST as atomic commit marker */
 } __attribute__((packed)) BootMetadataRecord_t;
 ```
+
+* **Atomic Verification Rule:** The bootloader verifies `commit_marker == 0xAA55AA55` AND `payload_crc32 == CRC32(record[0..offset_of_crc])`. If a power cut occurred before the commit marker was written, the record is discarded and the previous valid double-buffered record is loaded.
 
 ---
 
@@ -119,12 +117,5 @@ typedef struct {
 2. Metadata updated: `Slot_State = SLOT_TESTING`, `Boot_Attempts = 1`.
 3. Application boots and executes IEC 60730 Pre-Execution CPU/RAM self-tests and hardware safety initialization.
 4. If self-tests pass: Application sends IPC confirmation $\to$ Metadata updated to `Slot_State = SLOT_CONFIRMED` and `Boot_Attempts = 0`.
-5. If crash or watchdog trip occurs before confirmation: System reboots. Bootloader reads `Slot_State == TESTING` and increments `Boot_Attempts`.
+5. If crash or watchdog trip occurs before confirmation: System reboots. Bootloader reads `Slot_State == TESTING` and increments `Boot_Attempts` ($1 \to 2 \to 3$).
 6. Upon `Boot_Attempts >= 3`: Bootloader marks `Slot_State = SLOT_INVALID`, rolls back to the previous confirmed slot, and logs diagnostic alarm.
-
----
-
-## 5. Cryptographic Key Management
-
-* **Public Verification Key Only:** The MCU Flash stores **ONLY the public verification key** in the write-protected Key Region (Pages 124–127).
-* **Zero Private Key Storage:** Private signing keys are **never stored on the microcontroller** and reside solely in secure CI/CD build environments.
