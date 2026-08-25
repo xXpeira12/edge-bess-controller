@@ -51,8 +51,6 @@ This document is the authoritative **Single Source of Truth** for Flash memory p
 
 ## 3. Power-Loss Safe Metadata Record Structure
 
-To prevent metadata corruption during mid-write brownouts, the metadata table uses an atomic double-buffered commit record:
-
 ```c
 typedef struct {
     uint32_t record_magic;       /* 0x42455353 ("BESS") */
@@ -69,8 +67,6 @@ typedef struct {
     uint32_t commit_marker;      /* 0xAA55AA55 written LAST as atomic commit marker */
 } __attribute__((packed)) BootMetadataRecord_t;
 ```
-
-* **Atomic Verification Rule:** The bootloader verifies `commit_marker == 0xAA55AA55` AND `payload_crc32 == CRC32(record[0..offset_of_crc])`. If a power cut occurred before the commit marker was written, the record is discarded and the previous valid double-buffered record is loaded.
 
 ---
 
@@ -118,4 +114,4 @@ typedef struct {
 3. Application boots and executes IEC 60730 Pre-Execution CPU/RAM self-tests and hardware safety initialization.
 4. If self-tests pass: Application sends IPC confirmation $\to$ Metadata updated to `Slot_State = SLOT_CONFIRMED` and `Boot_Attempts = 0`.
 5. If crash or watchdog trip occurs before confirmation: System reboots. Bootloader reads `Slot_State == TESTING` and increments `Boot_Attempts` ($1 \to 2 \to 3$).
-6. Upon `Boot_Attempts >= 3`: Bootloader marks `Slot_State = SLOT_INVALID`, rolls back to the previous confirmed slot, and logs diagnostic alarm.
+6. Upon reaching the 4th boot attempt (`Boot_Attempts >= 3`): Bootloader marks `Slot_State = SLOT_INVALID`, rolls back to the previous confirmed slot, and logs diagnostic alarm.

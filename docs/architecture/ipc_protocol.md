@@ -7,7 +7,7 @@
 
 ## 1. Single Source of Truth: IPC Architecture & Master-Slave Model
 
-This document is the authoritative **Single Source of Truth** for the SPI DMA physical transport, frame serialization format, ARQ error control, session epochs, sequence number handling, and FreeRTOS task isolation.
+This document is the authoritative **Single Source of Truth** for the SPI DMA physical transport, 16-bit sequence frame serialization format, ARQ error control, session epochs, sequence number handling, and FreeRTOS task isolation.
 
 ```
 +===================================================================================================+
@@ -30,7 +30,7 @@ This document is the authoritative **Single Source of Truth** for the SPI DMA ph
 
 ---
 
-## 2. Robust SPI Frame Structure with Session Epoch
+## 2. Robust SPI Frame Structure (16-bit Sequence Number)
 
 ```
  0                   1                   2                   3
@@ -38,7 +38,9 @@ This document is the authoritative **Single Source of Truth** for the SPI DMA ph
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |       SYNC_WORD (0xA55A)      |   PROTO_VER   |  SESSION_ID   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|    SEQ_NUM    |   MSG_TYPE    |   MSG_FLAGS   |  PAYLOAD_LEN  |
+|          SEQ_NUM (uint16_t: 0 - 65535, 1:1 Modbus)            |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|   MSG_TYPE    |   MSG_FLAGS   |  PAYLOAD_LEN  |  PAYLOAD...   |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 | ... PAYLOAD (0 to 64 bytes) ...               |     CRC16     |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
@@ -51,16 +53,16 @@ This document is the authoritative **Single Source of Truth** for the SPI DMA ph
 | **0 – 1** | `SYNC_WORD` | `uint16_t` | `0xA55A` | Constant synchronization preamble for byte alignment. |
 | **2** | `PROTO_VER` | `uint8_t` | `0x01` | Protocol major version. |
 | **3** | `SESSION_ID` | `uint8_t` | $0 - 255$ | Link epoch counter incremented on MCU power-on/reset. |
-| **4** | `SEQ_NUM` | `uint8_t` | $0 - 255$ | Monotonic sequence counter with wraparound. |
-| **5** | `MSG_TYPE` | `uint8_t` | Enum | Defines payload schema and priority. |
-| **6** | `MSG_FLAGS` | `uint8_t` | Bitmask | Control flags: `BIT0=ACK`, `BIT1=NACK`, `BIT2=RETRY`, `BIT3=URGENT`. |
-| **7** | `PAYLOAD_LEN` | `uint8_t` | $0 - 64$ | Length $N$ of active payload data in bytes. |
-| **8 .. (8+N-1)**| `PAYLOAD` | `uint8_t[N]`| Binary Data | Serialized data structure. |
-| **(8+N) .. (9+N)**|`CRC16` | `uint16_t` | `0x0000-0xFFFF` | CRC-16-CCITT (`0x1021`, init `0xFFFF`) calculated over bytes $2 \dots (7+N)$. |
+| **4 – 5** | `SEQ_NUM` | `uint16_t` | $0 - 65535$ | Monotonic sequence counter (1:1 with Modbus `CMD_SEQ`). |
+| **6** | `MSG_TYPE` | `uint8_t` | Enum | Defines payload schema and priority. |
+| **7** | `MSG_FLAGS` | `uint8_t` | Bitmask | Control flags: `BIT0=ACK`, `BIT1=NACK`, `BIT2=RETRY`, `BIT3=URGENT`. |
+| **8** | `PAYLOAD_LEN` | `uint8_t` | $0 - 64$ | Length $N$ of active payload data in bytes. |
+| **9 .. (9+N-1)**| `PAYLOAD` | `uint8_t[N]`| Binary Data | Serialized data structure. |
+| **(9+N) .. (10+N)**|`CRC16` | `uint16_t` | `0x0000-0xFFFF`| CRC-16-CCITT (`0x1021`, init `0xFFFF`) calculated over bytes $2 \dots (8+N)$. |
 
 ---
 
-## 3. Session Synchronization & Modbus Sequence Mapping
+## 3. Session Synchronization & Modbus Sequence Alignment
 
-1. **Session Epoch Re-synchronization:** When either MCU resets, `SESSION_ID` changes. Upon detecting a new `SESSION_ID`, both microcontrollers flush transaction queues and reset `SEQ_NUM` to `0` before accepting new commands.
-2. **Modbus Sequence Mapping:** Modbus `CMD_SEQ` (Register `40016`, `uint16_t`) is mapped by the Gateway Core to the lower 8 bits of the SPI frame `SEQ_NUM` (`uint8_t`), preserving sequence tracking across industrial fieldbus and inter-processor buses.
+1. **1:1 Sequence Alignment:** By defining `SEQ_NUM` as `uint16_t`, Modbus `CMD_SEQ` (Register `40016`) maps directly into the SPI frame without truncation or byte slicing.
+2. **Session Handshake:** When an MCU resets, `SESSION_ID` increments. Microcontrollers exchange an initial ping handshake to flush stale transactions and reset `SEQ_NUM` to `0`.
