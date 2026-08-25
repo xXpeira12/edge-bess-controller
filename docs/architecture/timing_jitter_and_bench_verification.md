@@ -7,76 +7,47 @@
 
 ## 1. Single Source of Truth: Timing Budget & Determinism
 
-This document is the authoritative **Single Source of Truth** for the $50.0\text{ kHz}$ control loop timing budget, the 4 jitter metric definitions, NVIC priority assignments, and bench verification methodologies.
+This document is the authoritative **Single Source of Truth** for the $50.0\text{ kHz}$ control loop timing budget, execution schedule, WCET analysis, 4 jitter metric definitions, NVIC priority assignments, and bench verification methodologies.
 
-### 1.1 Core Timing Budget ($50\text{ kHz}$ Control Loop)
+### 1.1 Core Timing Budget & WCET Schedule ($50\text{ kHz}$ Loop)
 * **PWM Switching Frequency ($f_{sw}$):** $50.0\text{ kHz}$ ($\pm 0.05\%$ HSE crystal accuracy)
 * **Switching Period ($T_s$):** $20.0\,\mu\text{s}$ ($20,000\text{ ns}$)
-* **Primary Core Clock Frequency ($f_{cpu}$):** $170.0\text{ MHz}$ (STM32G474RE)
-* **Clock Period ($t_{clk}$):** $5.88\text{ ns}$ (@ 170 MHz)
-* **Maximum Allowable Total Jitter ($\Delta t_{jitter}$):** $\le \pm 50.0\text{ ns}$ ($\Delta T_{p-p} \le 100\text{ ns}$)
-* **Maximum Allowable ISR Execution Duration ($t_{isr}$):** $\le 8.0\,\mu\text{s}$ ($40.0\%$ CPU load limit at 170 MHz)
+* **Primary Core Clock Frequency ($f_{cpu}$):** $170.0\text{ MHz}$ (STM32G474RE, $t_{clk} = 5.88\text{ ns}$)
+
+```
++---------------------------------------------------------------------------------------------------+
+| STAGE-BY-STAGE EXECUTION TIMELINE (Ts = 20.0 microseconds)                                        |
+|                                                                                                   |
+|  0.0 us      1.0 us      1.2 us                  4.8 us     5.0 us                      20.0 us   |
+|  +-----------+-----------+-----------------------+----------+---------------------------+         |
+|  | ADC Conv  | DMA / IRQ | Cascaded PID Loop     | CCR/CMP  | Background Tasks & Slack  |         |
+|  | Dual-Mode | Stacking  | Current + Voltage Calc| Reload   | (75% CPU Headroom)        |         |
+|  +-----------+-----------+-----------------------+----------+---------------------------+         |
+|  |<-------- Worst-Case Execution Time (WCET) = 5.0 us ------>|<---- Slack = 15.0 us ----->|         |
+|  |<------------------- Maximum Allowable ISR Budget = 8.0 us (40% Load) ----------------->|         |
++---------------------------------------------------------------------------------------------------+
+```
+
+| Execution Stage | Duration | CPU Cycles (@ 170 MHz) | Description |
+| :--- | :--- | :--- | :--- |
+| **ADC Simultaneous Sampling & Conversion** | $1.00\,\mu\text{s}$ | $170\text{ cycles}$ | Dual ADC1/ADC2 hardware conversion triggered on TRGO |
+| **NVIC IRQ Entry & Context Stacking** | $0.20\,\mu\text{s}$ | $34\text{ cycles}$ | Hardware stacking and branch to `ADC_IRQHandler` |
+| **Cascaded Discrete PID Execution** | $3.60\,\mu\text{s}$ | $612\text{ cycles}$ | Inner current + outer voltage loop, clamping, anti-windup |
+| **HRTIM Compare Shadow Register Reload** | $0.20\,\mu\text{s}$ | $34\text{ cycles}$ | Writing updated compare value to shadow register |
+| **TOTAL WORST-CASE EXECUTION TIME (WCET)** | $\mathbf{5.00\,\mu\text{s}}$ | $\mathbf{850\text{ cycles}}$ | **$25.0\%$ CPU Load (Well below $8.0\,\mu\text{s}$ / $40\%$ budget)** |
+
+### 1.2 Asynchronous Background SPI DMA Telemetry Timing
+* A full 76-byte telemetry frame transfer over $10\text{ MHz}$ SPI requires:
+  $$T_{spi} = \frac{76\text{ bytes} \times 8\text{ bits}}{10\times 10^6\text{ bps}} = 60.8\,\mu\text{s}$$
+* **Zero Loop Blocking:** SPI DMA transfers execute autonomously in background silicon memory channels without CPU intervention, operating asynchronously across multiple $20\,\mu\text{s}$ PWM cycles without introducing jitter to the Priority 0 control loop.
 
 ---
 
 ## 2. Disambiguation of the Four Jitter Metrics
 
-```
-+===================================================================================================+
-|                                    FOUR JITTER METRICS BREAKDOWN                                  |
-|                                                                                                   |
-|  1. Trigger Jitter (t_trig_jitter):                                                               |
-|     Time from internal timer TRGO center-point event to physical ADC sample aperture hold.       |
-|     Budget: <= +/- 5.0 ns (Hardware silicon interconnect delay). Requires DSO measurement.        |
-|                                                                                                   |
-|  2. Interrupt Latency Jitter (t_irq_jitter):                                                      |
-|     Time from ADC End-of-Conversion (EOC) pulse to first instruction in ADC_IRQHandler.          |
-|     Budget: <= +/- 15.0 ns (NVIC hardware stacking variance). Requires DSO measurement.          |
-|                                                                                                   |
-|  3. Execution Time Jitter (t_exec_jitter):                                                        |
-|     Variation in software execution time from ISR entry to PID discrete math and saturation done. |
-|     Budget: <= +/- 20.0 ns. Measurable in firmware via Cortex-M4 DWT cycle counter.               |
-|                                                                                                   |
-|  4. Sample-to-Duty-Update Timing Jitter (t_update_jitter):                                        |
-|     Total end-to-end delay variation from ADC instantaneous sampling to physical PWM comparator   |
-|     (HRTIM_CMP1 / TIM1_CCR1) hardware shadow register reload taking effect in the power stage.   |
-|     Overall Control Loop Limit: <= +/- 50.0 ns (Peak-to-Peak <= 100.0 ns). Requires DSO.          |
-+===================================================================================================+
-```
-
----
-
-## 3. NVIC Priority Hierarchy & Preemption Policy
-
-* **Priority 0 (Highest):** `HRTIM_Master_IRQHandler` / `ADC_IRQHandler` (Inner Current Loop).
-* **Priority 1:** `HRTIM_FLT_IRQHandler` / `COMP_IRQHandler` (Tier-0 Break Diagnostic Logging).
-* **Priority 2:** `DMA1_Channel2_3_IRQHandler` (SPI IPC DMA Transfer Complete).
-* **Priority 3:** System Tick / Diagnostics (`SysTick_Handler`).
-
-```
-+---------------------------------------------------------------------------------------------------+
-| PREEMPTION POLICY: No intentional software ISR preemption is permitted during the control loop.   |
-| Inner loop execution runs at Priority 0, unmasked by any FreeRTOS critical sections.             |
-+---------------------------------------------------------------------------------------------------+
-```
-
----
-
-## 4. Verification Protocols: Bench DSO vs In-Firmware DWT
-
-```
-+===================================================================================================+
-|                                    VERIFICATION TOOL RESPONSIBILITIES                             |
-|                                                                                                   |
-|  CORTEX-M4 DWT CYCLE COUNTER (In-Firmware Telemetry):                                             |
-|  - Measures ONLY internal software execution cycles (t_exec).                                     |
-|  - Tracks min/max/average PID compute duration at 5.88 ns resolution (170 MHz).                   |
-|  - Reports execution jitter over telemetry every 100 ms.                                          |
-|                                                                                                   |
-|  DIGITAL STORAGE OSCILLOSCOPE (DSO >= 100 MHz, >= 1 GSa/s, Benchtop Physical Verification):       |
-|  - Measures physical trigger jitter (CH1: TRGO, CH2: ADC sample testpoint).                       |
-|  - Measures physical interrupt latency jitter (CH1: TRGO, CH2: Fast GPIO ISR marker).            |
-|  - Measures physical sample-to-duty update jitter (CH1: TRGO, CH2: PWM switching edge).          |
-|  - Infinite persistence + horizontal histogram over N >= 100,000 cycles (>= 2.0 s runtime).       |
-+===================================================================================================+
-```
+* **Trigger Jitter ($t_{trig\_jitter}$):** $\le \pm 5.0\text{ ns}$ (TRGO to ADC aperture). *Requires DSO measurement.*
+* **Interrupt Latency Jitter ($t_{irq\_jitter}$):** $\le \pm 15.0\text{ ns}$ (EOC to ISR entry). *Requires DSO measurement.*
+* **Execution Time Jitter ($t_{exec\_jitter}$):** $\le \pm 20.0\text{ ns}$ (ISR compute duration). *Tracked in-firmware via Cortex-M4 DWT.*
+* **Sample-to-Duty-Update Jitter ($t_{update\_jitter}$):** $\le \pm 50.0\text{ ns}$ (ADC sample to physical PWM reload). *Requires DSO measurement.*
+* **Verification Status:** Specification consistency and invariant simulation model verified; hardware physical measurements pending benchtop prototype execution.
+* **Preemption Policy:** No intentional software ISR preemption is permitted during control loop execution.

@@ -13,36 +13,37 @@ This document is the authoritative **Single Source of Truth** for all analog sen
 +===================================================================================================+
 |                                    ANALOG FRONT-END ARCHITECTURE                                  |
 |                                                                                                   |
-|  [ V_BUS 18-24V ] ----> [ 10:1 Resistor Divider ] ----> [ Unity Gain Op-Amp ] ----> [ RC Filter ]|
-|                                                               |                             |     |
-|                                                               v                             v     |
-|                                                        [ COMP3 (PA0) ]              [ ADC2 Channel|
-|                                                                                             |     |
-|  [ Current Shunt ] ---> [ INA240A1 (Gain 20) ] -------> [ Mid-Rail 1.650V Ref]              |     |
-|    (10 mOhm 1%)                  |                            |                             |     |
-|                                  +----------------------------+                             |     |
-|                                  |                            |                             |     |
-|                                  v                            v                             |     |
-|                          [ COMP1/2 Over-I Trip ]       [ RC Filter ]                        |     |
-|                          (Internal STM32G4)            (fc = 72.3 kHz)                      |     |
-|                                  |                            |                             |     |
-|                                  v                            v                             |     |
-|                          [ HRTIM1_FLT1/4/5 ]           [ ADC1 Channel (50kHz) ] <-----------+     |
+|  [ V_BUS 18-24V ] ----> [ 10:1 Resistor Divider ] ----> [ Buffer Op-Amp ] --+-> [ COMP3 (PA0) ]  |
+|                                                                              |  (Fast Trip Ref)   |
+|                                                                              +-> [ RC Filter ]    |
+|                                                                                  (fc = 48.2 kHz)  |
+|                                                                                  v                |
+|                                                                           [ ADC2 Pin (0-3.0V) ]   |
+|                                                                                                   |
+|  [ Current Shunt ] ---> [ INA240A1 (Gain 20) ] -------> [ Mid-Rail 1.650V Ref]                    |
+|    (10 mOhm 1%)                  |                            |                                   |
+|                                  +----------------------------+                                   |
+|                                  |                            |                                   |
+|                                  v                            v                                   |
+|                          [ COMP1/2 Over-I Trip ]       [ RC Filter ]                              |
+|                          (Internal STM32G4)            (fc = 72.3 kHz)                            |
+|                                  |                            |                                   |
+|                                  v                            v                                   |
+|                          [ HRTIM1_FLT1/4 ]             [ ADC1 Channel (50kHz) ] <-----------------+
 +===================================================================================================+
 ```
 
 ---
 
-## 2. Voltage Sensing Conditioning Circuitry & Anti-Aliasing Filter
+## 2. Voltage Sensing Conditioning Circuitry & Fast Trip Path Separation
 
-### 2.1 Resistive Divider Network & Buffering
+### 2.1 Resistive Divider Network & Topology Separation
 $$V_{adc\_in} = V_{bus} \cdot \left( \frac{R_2}{R_1 + R_2} \right)$$
 * $R_1 = 90.0\text{ k}\Omega \pm 0.1\%$, $R_2 = 10.0\text{ k}\Omega \pm 0.1\%$ ($10:1$ attenuation ratio $K_{div} = 0.1000$).
-* Nominal $V_{bus} = 24.0\text{ V} \to V_{adc} = 2.400\text{ V}$.
-* Over-Voltage Trip $V_{bus} = 26.0\text{ V} \to V_{adc} = 2.600\text{ V}$ ($26.0\text{ V} / 10$).
+* **Topology Separation:** The Over-Voltage comparator (`COMP3_INP` on `PA0`) is tapped directly from the low-impedance Op-Amp buffer output **before** the passive RC anti-aliasing filter. This architectural split eliminates filter phase delay from the Tier-0 hardware trip path.
 
-### 2.2 Anti-Aliasing Filter Calculation
-$$f_c = \frac{1}{2 \pi R_{filt} C_{filt}} = \frac{1}{2 \pi \times 1000 \times 3.3 \times 10^{-9}} \approx 48.2\text{ kHz}$$
+### 2.2 Anti-Aliasing Filter Calculation (SSOT Cutoff: $48.2\text{ kHz}$)
+$$f_c = \frac{1}{2 \pi R_{filt} C_{filt}} = \frac{1}{2 \pi \times 1000 \times 3.3 \times 10^{-9}} \approx 48.23\text{ kHz}$$
 * At $f_{Nyquist} = 25.0\text{ kHz}$: $|H(25\text{ kHz})| \approx 0.887$ ($-1.04\text{ dB}$), $\theta = -27.4^\circ$.
 * At $f_{sw} = 50.0\text{ kHz}$: $|H(50\text{ kHz})| \approx 0.694$ ($-3.17\text{ dB}$), $\theta = -46.0^\circ$.
 
@@ -58,28 +59,42 @@ $$f_c = \frac{1}{2 \pi R_{filt} C_{filt}} = \frac{1}{2 \pi \times 1000 \times 3.
 
 ### 3.2 Physical Threshold-Crossing Latency Model
 * **INA240A1 Parameters:** Slew Rate = $2.0\text{ V/\mu s}$, Full $0.1\%$ Settling Time = $9.6\,\mu\text{s}$.
-* **Benchmark $1.5\text{ A}$ Over-Current Step:**
-  $$\Delta V_{out} = \Delta I \times S = 1.5\text{ A} \times 0.200\text{ V/A} = 300\text{ mV}$$
-  $$T_{slew} = \frac{0.300\text{ V}}{2.0\text{ V/\mu s}} = 150\text{ ns}$$
-  $$T_{CSA\_cross} = T_{prop} + T_{slew} \approx 150\text{ ns} + 150\text{ ns} = \mathbf{300\text{ ns}}$$
-* Threshold-crossing occurs in $300\text{ ns}$, which is measurably distinct from full $9.6\,\mu\text{s}$ settling.
+* **Benchmark $1.5\text{ A}$ Over-Current Step ($3.5\text{ A} \to 5.0\text{ A}$):**
+  $$\Delta V_{out} = 1.5\text{ A} \times 0.200\text{ V/A} = 300\text{ mV}$$
+  $$T_{slew} = \frac{0.300\text{ V}}{2.0\text{ V/\mu s}} = 150\text{ ns}, \quad T_{CSA\_cross} \approx T_{prop}(150\text{ns}) + T_{slew}(150\text{ns}) = \mathbf{300\text{ ns}}$$
+* **Worst-Case Full $5.0\text{ A}$ Over-Current Step ($0.0\text{ A} \to 5.0\text{ A}$):**
+  $$\Delta V_{out} = 5.0\text{ A} \times 0.200\text{ V/A} = 1000\text{ mV}$$
+  $$T_{slew} = \frac{1.000\text{ V}}{2.0\text{ V/\mu s}} = 500\text{ ns}, \quad T_{CSA\_cross,max} \approx T_{prop}(150\text{ns}) + 350\text{ns} \approx \mathbf{500\text{ ns}}$$
+
+### 3.3 Current Sensing Antialiasing Filter (SSOT Cutoff: $72.3\text{ kHz}$)
+$$f_c = \frac{1}{2 \pi \times 1000 \times 2.2 \times 10^{-9}} \approx 72.34\text{ kHz}$$
+* At $f_{Nyquist} = 25.0\text{ kHz}$: $|H(25\text{k})| \approx 0.945$ ($-0.49\text{ dB}$), $\theta = -19.1^\circ$.
+* At $f_{sw} = 50.0\text{ kHz}$: $|H(50\text{k})| \approx 0.822$ ($-1.70\text{ dB}$), $\theta = -34.7^\circ$.
 
 ---
 
-## 4. STM32G474RE Exact Comparator / DAC Routing Matrix (RM0440 / AN5094)
+## 4. Itemized Current Trip Threshold Error Budget
+
+| Error Source | Parameter Specification | Equivalent Current Error |
+| :--- | :--- | :--- |
+| **Shunt Resistor Tolerance** | $\pm 1.0\%$ on $10\text{ m}\Omega$ | $\pm 50.0\text{ mA}$ |
+| **INA240A1 Gain Error** | $\pm 0.20\%$ | $\pm 10.0\text{ mA}$ |
+| **INA240A1 Input Offset Voltage** | $\pm 25\,\mu\text{V} / 10\text{ m}\Omega$ | $\pm 2.5\text{ mA}$ |
+| **DAC Reference Voltage / VDDA** | $\pm 1.0\%$ | $\pm 50.0\text{ mA}$ |
+| **Internal Comparator Offset** | $\pm 5.0\text{ mV} / 0.200\text{ V/A}$ | $\pm 25.0\text{ mA}$ |
+| **Thermal Drift ($-40^\circ\text{C}$ to $+85^\circ\text{C}$)**| Combined TCR & drift | $\pm 12.5\text{ mA}$ |
+| **TOTAL WORST-CASE ERROR BUDGET** | Sum of error contributions | $\mathbf{\pm 150.0\text{ mA} \quad (\pm 0.15\text{ A} / \pm 3.0\%)}$ |
+
+$$\mathbf{I_{trip,actual} = \pm 5.0\text{ A} \pm 0.15\text{ A} \quad (\pm 4.85\text{ A} \dots \pm 5.15\text{ A})}$$
+
+---
+
+## 5. STM32G474RE Exact Comparator / DAC Routing Matrix (RM0440 / AN5094)
 
 | Protection Channel | Comparator | Non-Inverting Input (`COMPx_INP`) | Inverting Input (`COMPx_INM`) | Internal Reference | HRTIM Fault Channel (RM0440 Table 223) | Action |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Hard OC+** ($> +5.0\text{ A}$) | `COMP1` | `PA1` (CSA $V_{out}$) | `DAC1_CH1` | $2.650\text{ V}$ | `HRTIM1_FLT4` | PWM forced LOW ($\le 2.0\,\mu\text{s}$) |
 | **Hard OC-** ($< -5.0\text{ A}$) | `COMP2` | `DAC3_CH2` | `PA7` (CSA $V_{out}$) | $0.650\text{ V}$ | `HRTIM1_FLT1` | PWM forced LOW ($\le 2.0\,\mu\text{s}$) |
 | **Hard OV** ($> 26.0\text{ V}$) | `COMP3` | `PA0` ($V_{bus}$ 10:1 AFE) | `DAC1_CH2` | $2.600\text{ V}$ ($26\text{V}/10$) | `HRTIM1_FLT5` | PWM forced LOW ($\le 2.0\,\mu\text{s}$) |
-
-### 4.1 RM0440 Table 223 Internal HRTIM Fault Mapping
-* `HRTIM1_FLT1` $\leftarrow$ `COMP2` (Hard OC-)
-* `HRTIM1_FLT2` $\leftarrow$ `COMP4`
-* `HRTIM1_FLT3` $\leftarrow$ `COMP6`
-* `HRTIM1_FLT4` $\leftarrow$ `COMP1` (Hard OC+)
-* `HRTIM1_FLT5` $\leftarrow$ `COMP3` (Hard OV)
-* `HRTIM1_FLT6` $\leftarrow$ `COMP5`
 
 * **Hardware Invariant:** HRTIM fault digital filters are disabled (`FLTxF = 0000`) for zero-delay asynchronous tripping.

@@ -7,11 +7,12 @@
 
 ## 1. Single Source of Truth: Control State Machine & Transition Ownership
 
-This document is the authoritative **Single Source of Truth** for the Finite State Machine (FSM), state definitions, quantified derating hysteresis bands, battery recovery checks, and transition authority.
+This document is the authoritative **Single Source of Truth** for the Finite State Machine (FSM), state definitions, quantified derating hysteresis bands, transition matrix, and battery recovery checks.
 
-### 1.1 State Authority Principle
+### 1.1 State Authority Principle & Direct Transition Prohibitions
 * **STM32 Exclusive Ownership:** The STM32 Control Core FSM is the **sole authoritative owner** of system state transitions.
-* **Supervisory Requests:** External Modbus and IPC commands are transition requests. If a request violates state transition guard conditions, the STM32 rejects the command and sets `CMD_RESULT = 2` (`Rejected_InvalidState`).
+* **Direct Mode Transition Prohibition:** Direct transitions between `STATE_CHARGE_ACTIVE` and `STATE_DISCHARGE_ACTIVE` are **strictly forbidden**. Any operational mode change must execute a controlled ramp-down to `STATE_IDLE` before entering a new mode.
+* **Tier-1 Emergency Ramp Fallback:** If a Level 2 software emergency ramp-down ($100\text{ A/s}$ within $50\text{ ms}$) encounters sensor failure or fails to reduce current below $0.5\text{ A}$, the system triggers an immediate hardware Timer Break trip to `STATE_SAFE_STATE`.
 
 ```
 +===================================================================================================+
@@ -67,6 +68,7 @@ This document is the authoritative **Single Source of Truth** for the Finite Sta
 |  [ Level 2 Fault / Emergency Stop: Ramp-Down at 100 A/s ]       |                                 |
 |  +------------------------------------------------------+       |                                 |
 |  | Decelerates to 0A in <= 50 ms, disables PWM -> IDLE  |       |                                 |
+|  | (Fallback: If current doesn't drop -> SAFE_STATE)    |       |                                 |
 |                                                                 |                                 |
 |  [ Level 3 Critical Hardware Fault (Tier-0 Break Trip <= 2.0 us) ]                                |
 |  +--------------------------------------------------------------+                                 |
@@ -97,27 +99,22 @@ This document is the authoritative **Single Source of Truth** for the Finite Sta
 
 ---
 
-## 2. Quantified Derating Triggers & Hysteresis
+## 2. Complete State Transition Matrix
 
-| Trigger Source | Entry Threshold | Exit Threshold | Action in `STATE_DERATING_ACTIVE` |
-| :--- | :--- | :--- | :--- |
-| **Heatsink Temperature** | $T > 55.0^\circ\text{C}$ | $T < 45.0^\circ\text{C}$ | Clamps $I_{ref}$ linearly ($100\%$ at $55^\circ\text{C} \to 50\%$ at $65^\circ\text{C}$). |
-| **Low Battery SOC** | $\text{SOC} < 15.0\%$ | $\text{SOC} > 20.0\%$ | Discharge current setpoint clamped to $1.0\text{ A}$ maximum. |
-| **High Battery SOC** | $\text{SOC} > 95.0\%$ | $\text{SOC} < 90.0\%$ | Charge current setpoint clamped to $0.5\text{ A}$ taper current. |
-
----
-
-## 3. Detailed State Table & Actions
-
-### 3.1 State 8: `STATE_RECOVERY_CHECK`
-* **Entry:** `FAULT_CLEAR_CMD = 0x00A5` received in `STATE_SAFE_STATE`.
-* **Battery & Bus Verification:**
-  - $V_{bat} \ge 11.0\text{ V}$ (Battery present and above deep discharge).
-  - $16.0\text{ V} \le V_{bus} \le 25.0\text{ V}$ (DC bus stable).
-  - $|I_L| < 0.20\text{ A}$ (Zero current).
-  - $T_{sink} < 45.0^\circ\text{C}$ (Thermal recovery).
-* **Exit:** If passed $\to$ `STATE_IDLE`; if failed $\to$ `STATE_SAFE_STATE`.
-
-### 3.2 State 9: `STATE_SAFE_STATE`
-* **Actions:** Hardware Break forces PWM `LOW` $\le 2.0\,\mu\text{s}$. Latches `FAULT_CODE` in register `40010`.
-* **Exit:** Accepts `FAULT_CLEAR_CMD = 0x00A5` to transition to `STATE_RECOVERY_CHECK`.
+| Current State | Target State | Trigger Condition | Guard Condition / Validation | Action Taken |
+| :--- | :--- | :--- | :--- | :--- |
+| `STATE_POWER_ON` | `STATE_INIT_AND_SELF_TEST` | Reset vector complete | Clocks stable (170 MHz) | Vector table remap |
+| `STATE_INIT_AND_SELF_TEST` | `STATE_IDLE` | Startup tests passed | Reg, RAM, Flash CRC OK | PWM in High-Z, relays open |
+| `STATE_INIT_AND_SELF_TEST` | `STATE_SAFE_STATE` | Any diagnostic failure | Test fail flag set | Hardware Break trip |
+| `STATE_IDLE` | `STATE_CHARGE_RAMP` | `SYS_CONTROL_CMD == 1` | $18\text{V} \le V_{bus} \le 24.5\text{V}$ | Buck PWM soft-start |
+| `STATE_IDLE` | `STATE_DISCHARGE_RAMP` | `SYS_CONTROL_CMD == 2` | $V_{bat} \ge 10.5\text{V}$ | Boost PWM soft-start |
+| `STATE_CHARGE_RAMP` | `STATE_CHARGE_ACTIVE` | Target current reached | $|I_L - I_{target}| \le 0.1\text{A}$ | Cascaded PID active |
+| `STATE_CHARGE_ACTIVE` | `STATE_IDLE` | `SYS_CONTROL_CMD == 0` | Normal stop command | Controlled ramp-down ($2.0\text{ A/s}$) |
+| `STATE_CHARGE_ACTIVE` | `STATE_DERATING_ACTIVE` | Warning threshold hit | $T > 55^\circ\text{C}$ or $\text{SOC} > 95\%$ | Throttles current setpoint |
+| `STATE_CHARGE_ACTIVE` | `STATE_DISCHARGE_ACTIVE` | Direct switch attempt | **PROHIBITED** | Command rejected (`CMD_RESULT = 2`) |
+| `STATE_DERATING_ACTIVE` | `STATE_CHARGE_ACTIVE` | Conditions normalized | $T < 45^\circ\text{C}$ for $> 5\text{s}$ | Restores full current setpoint |
+| `* (Any Operating)` | `STATE_IDLE` | Level 2 Software Fault | Soft OC/OT, UVLO, IPC timeout | Emergency ramp-down ($100\text{ A/s}$) |
+| `* (Any State)` | `STATE_SAFE_STATE` | Level 3 Critical Fault | Hardware OC/OV, Watchdog | Instant Tier-0 Break Trip |
+| `STATE_SAFE_STATE` | `STATE_RECOVERY_CHECK` | `FAULT_CLEAR_CMD == 0x00A5` | Accepted only in `SAFE_STATE` | Re-checks sensors & re-arms break |
+| `STATE_RECOVERY_CHECK` | `STATE_IDLE` | All checks passed | $V_{bat} \ge 11\text{V}$, $16\text{V} \le V_{bus} \le 25\text{V}$ | Power conversion remains IDLE |
+| `STATE_RECOVERY_CHECK` | `STATE_SAFE_STATE` | Any check failed | Sensor out of safe band | Re-latches fault code |

@@ -12,10 +12,10 @@ This document is the authoritative **Single Source of Truth** for the SCADA Modb
 ### 1.1 Strict Safety Rule
 > **CRITICAL SAFETY RESTRICTION:** Direct manipulation or writing of PWM duty cycles, timer period registers, dead-time parameters, or raw inner-loop PID gains via Modbus is **STRICTLY PROHIBITED**.
 
-### 1.2 Mailbox Command Semantics & Atomicity Snapshot
+### 1.2 Mailbox Command Semantics & Double-Buffered Snapshot
 1. **Edge-Triggered Mailbox:** `SYS_CONTROL_CMD` (Register `40001`) acts as an edge-triggered command mailbox. Writing a valid value triggers an IPC transaction to the Control MCU.
 2. **Dedicated Fault Clear Key (Register `40014`):** Latched faults can only be cleared by writing the magic key `0x00A5` to `FAULT_CLEAR_CMD`. Writing `0x00A5` is **accepted ONLY in `SAFE_STATE`**; issuing it in `IDLE`, `CHARGE`, or `DISCHARGE` returns `CMD_RESULT = 2` (`Rejected_InvalidState`).
-3. **Atomic Multi-Register Snapshot ($\le 20\text{ ms}$ Age):** Upon receipt of Modbus Function Code `0x03` covering registers $40002 - 40018$, the Gateway creates a coherent shadow memory snapshot with maximum age $\le 20\text{ ms}$, guaranteeing that 32-bit values (such as `UPTIME_MSW`/`LSW`) are read without tear.
+3. **Double-Buffered Atomic Snapshot ($\le 20\text{ ms}$ Age):** Upon receipt of Modbus Function Code `0x03` covering registers $40002 - 40018$, the Gateway serves data from an atomic double-buffered shadow memory buffer updated every $\le 20\text{ ms}$, guaranteeing that 32-bit values (such as `UPTIME_MSW`/`LSW`) are read without tear.
 4. **Exception Handling:** Writing to any read-only register ($40002 - 40013$, $40015 - 40018$) returns Modbus Exception Code `0x02` (`Illegal Data Address`).
 
 ---
@@ -34,12 +34,12 @@ This document is the authoritative **Single Source of Truth** for the SCADA Modb
 | **`40008`** | `TEMPERATURE` | `int16_t` | $0.1^\circ\text{C} / \text{LSB}$ | Read-Only | $-200 \dots +1250$, `0x7FFF` | Power Stage Heatsink Temperature ($265 = 26.5^\circ\text{C}$). Sentinel: `0x7FFF`. |
 | **`40009`** | `OPERATING_MODE` | `uint16_t` | Enum | Read-Only | `0 - 3` | High-Level Operating Mode:<br>`0` = `IDLE`<br>`1` = `CHARGE`<br>`2` = `DISCHARGE`<br>`3` = `SAFE_STATE` |
 | **`40010`** | `FAULT_CODE` | `uint16_t` | Hex Code | Read-Only | `0x0000 - 0xFFFF` | Diagnostic hex code of highest priority active fault. |
-| **`40011`** | `FW_VERSION` | `uint16_t` | BCD Format | Read-Only | `0x0000 - 0x9999` | Firmware version in BCD (`0x0300` = v3.0.0). |
+| **`40011`** | `FW_VERSION` | `uint16_t` | BCD Format | Read-Only | `0x0000 - 0x9999` | Normative BCD encoding `0xMMmm` (e.g. `0x0130` = v1.3.0). |
 | **`40012`** | `UPTIME_MSW` | `uint16_t` | Seconds | Read-Only | $0 - 65535$ | System Uptime 32-bit Counter (MSW). |
 | **`40013`** | `UPTIME_LSW` | `uint16_t` | Seconds | Read-Only | $0 - 65535$ | System Uptime 32-bit Counter (LSW). |
 | **`40014`** | `FAULT_CLEAR_CMD` | `uint16_t` | Magic Key | R/W | `0x00A5` | Dedicated Fault Clear. Accepted ONLY in `SAFE_STATE`. |
 | **`40015`** | `CMD_RESULT` | `uint16_t` | Enum | Read-Only | `0 - 6` | `0` = None<br>`1` = Accepted<br>`2` = Rejected_InvalidState<br>`3` = Rejected_FaultActive<br>`4` = Rejected_Limit<br>`5` = Rejected_Safety<br>`6` = Rejected_IPC |
-| **`40016`** | `CMD_SEQ` | `uint16_t` | Counter | Read-Only | $0 - 65535$ | Monotonic sequence number echo of last command. |
+| **`40016`** | `CMD_SEQ` | `uint16_t` | Counter | Read-Only | $0 - 65535$ | Monotonic sequence number echo of last command (1:1 with SPI SEQ_NUM). |
 | **`40017`** | `FSM_STATE` | `uint16_t` | Enum | Read-Only | `0 - 9` | Detailed Internal FSM State ($0-9$). |
 | **`40018`** | `LATCHED_FAULT_FLAGS`|`uint16_t`| Bitfield | Read-Only | `0x0000 - 0xFFFF` | Latched historical fault bitmap (cleared by 40014). |
 

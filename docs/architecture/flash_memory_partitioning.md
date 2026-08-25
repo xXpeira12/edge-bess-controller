@@ -7,7 +7,7 @@
 
 ## 1. Single Source of Truth: Memory Geometry & Fixed Bootloader Architecture
 
-This document is the authoritative **Single Source of Truth** for Flash memory partitioning, symmetric slot geometries, power-loss-safe metadata formats, confirmed boot sequences, and public key management.
+This document is the authoritative **Single Source of Truth** for Flash memory partitioning, symmetric slot geometries, power-loss-safe metadata formats, confirmed boot sequences, SRAM flash driver execution, and public key management.
 
 ```
 +===================================================================================================+
@@ -17,7 +17,8 @@ This document is the authoritative **Single Source of Truth** for Flash memory p
 |  - Bank 1 (256 KB, Pages 0-127, Addr 0x0800_0000) + Bank 2 (256 KB, Pages 0-127, Addr 0x0804_0000)|
 |  - Page Size: Uniform 2 KB per page (256 pages total across two banks)                            |
 |  - Symmetric Dual-Bank Layout: Slot A (200 KB) and Slot B (200 KB)                                |
-|  - Fixed Base Bootloader: Executes from 0x0800_0000, validates metadata, jumps to active slot     |
+|  - SRAM Driver Execution: Flash routines execute from RAM via __attribute__((section(".ramfunc")))|
+|  - Hardware Protection: Flash Write Protection (WRP) on Pages 120-127 & Readout Protection (RDP)  |
 +===================================================================================================+
 ```
 
@@ -35,6 +36,7 @@ This document is the authoritative **Single Source of Truth** for Flash memory p
             | Pages 16 - 115 (200 KB) : Application Slot A          |
             | Pages 116 - 123 (16 KB) : NVRAM System Configuration  |
             | Pages 124 - 127 (8 KB)  : Public Key Verification Reg |
+            | * Pages 120-127 Protected by Flash WRP & RDP Level 1   |
 0x0804_0000 +-------------------------------------------------------+
             | BANK 2: SECONDARY BANK (256 KB - Pages 0 to 127)      |
             |                                                       |
@@ -49,7 +51,18 @@ This document is the authoritative **Single Source of Truth** for Flash memory p
 
 ---
 
-## 3. Power-Loss Safe Metadata Record Structure
+## 3. SRAM Execution & Dual-Bank Read-While-Write (RWW)
+
+* **SRAM Driver Routine Execution:** All low-level Flash write and erase functions are linked into SRAM:
+  ```c
+  __attribute__((section(".ramfunc"), noinline))
+  HAL_StatusTypeDef Flash_ErasePage_SRAM(uint32_t page_address);
+  ```
+* **Zero CPU Stall Dual-Bank Updating:** While the CPU executes real-time power control code from Application Slot A in Bank 1, the bootloader/application can erase and program staging blocks in Bank 2 without blocking the Cortex-M4 instruction pipeline or missing $50\text{ kHz}$ control loop interrupts.
+
+---
+
+## 4. Power-Loss Safe Metadata Record Structure
 
 ```c
 typedef struct {
@@ -70,48 +83,6 @@ typedef struct {
 
 ---
 
-## 4. Confirmed Boot Sequence & Automatic Rollback
+## 5. Confirmed Boot Sequence & Automatic Rollback
 
-```
-                         CONFIRMED BOOT STATE MACHINE
-                         
-            +-------------------------------------------------------+
-            |                   POWER-ON RESET                      |
-            +-------------------------------------------------------+
-                                        |
-                                        v
-            +-------------------------------------------------------+
-            |               BOOTLOADER INITIALIZATION               |
-            |  - Read & Validate Active Metadata Record             |
-            +-------------------------------------------------------+
-                                        |
-                                        v
-            +-------------------------------------------------------+
-            |              EVALUATE ACTIVE SLOT STATE               |
-            +-------------------------------------------------------+
-                 |                                      |
-         [ State == TESTING ]                  [ State == CONFIRMED ]
-                 |                                      |
-         [ Boot Count >= 3? ]                           v
-            /          \                       +--------------------+
-          [YES]        [NO]                    | VERIFY SLOT DIGEST |
-          /              \                     +--------------------+
-         v                v                             |
-  +--------------+  +-------------------+          [ Digest OK? ]
-  | MARK INVALID |  | INCREMENT COUNT   |              /         \
-  | ROLLBACK TO  |  | JUMP TO TESTING   |           [YES]       [NO]
-  | PREV CONFIRM |  | IMAGE             |            /             \
-  +--------------+  +-------------------+           v               v
-                                            +---------------+ +--------------+
-                                            | JUMP TO MAIN  | | ENTER SAFE   |
-                                            | APPLICATION   | | RECOVERY     |
-                                            +---------------+ +--------------+
-```
-
-### 4.1 Step-by-Step Confirmed Boot Sequence
-1. Staged image verified in RAM: SHA-256 + ECDSA secp256r1 signature verified against immutable on-chip public key.
-2. Metadata updated: `Slot_State = SLOT_TESTING`, `Boot_Attempts = 1`.
-3. Application boots and executes IEC 60730 Pre-Execution CPU/RAM self-tests and hardware safety initialization.
-4. If self-tests pass: Application sends IPC confirmation $\to$ Metadata updated to `Slot_State = SLOT_CONFIRMED` and `Boot_Attempts = 0`.
-5. If crash or watchdog trip occurs before confirmation: System reboots. Bootloader reads `Slot_State == TESTING` and increments `Boot_Attempts` ($1 \to 2 \to 3$).
-6. Upon reaching the 4th boot attempt (`Boot_Attempts >= 3`): Bootloader marks `Slot_State = SLOT_INVALID`, rolls back to the previous confirmed slot, and logs diagnostic alarm.
+* **Maximum 3 Boot Attempts:** Application is given a maximum of 3 boot attempts ($1 \to 2 \to 3$). If a watchdog reset or crash occurs before safety initialization writes `CONFIRMED`, automatic rollback to the previous confirmed slot triggers before the 4th attempt.
