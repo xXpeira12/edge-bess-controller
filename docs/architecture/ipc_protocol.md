@@ -86,7 +86,7 @@ All packets conform to a fixed header with variable payload length and trailing 
 
 ```
                             IPC PROTOCOL STATE MACHINE
-                            
+
             +-------------------------------------------------------+
             |                      IPC_UNINIT                       |
             |  - Hardware reset; DMA registers cleared              |

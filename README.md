@@ -75,7 +75,7 @@ To maintain academic and industrial rigor without overstating regulatory status 
 
 ```
                                 ANALOG SENSING FRONT-END TOPOLOGY
-                                
+
   +------------------------------------------------------------------------------------------------+
   | VOLTAGE SENSING PATH (DC Bus / Battery Terminal)                                               |
   |                                                                                                |
@@ -197,7 +197,7 @@ To ensure rigorous real-time determinism across the power stage, four distinct t
 
 ```
                             SYSTEM CONTROL STATE MACHINE
-                            
+
             +-------------------------------------------------------+
             |                       POWER_ON                        |
             +-------------------------------------------------------+

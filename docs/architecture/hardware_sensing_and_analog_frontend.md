@@ -99,7 +99,7 @@ $$f_c = \frac{1}{2 \pi R_{filt} C_{filt}} = \frac{1}{2 \pi \times 1000 \times 3.
 
 ```
                           CSA OUTPUT SPLIT CIRCUIT
-                          
+
                        +-----------------------------+
                        |       INA240 Output         |
                        | V_out = 1.65V +/- 0.4V/A    |

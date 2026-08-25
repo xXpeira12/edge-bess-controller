@@ -135,7 +135,7 @@ bool Safety_TestCPURegisters(void)
     /* Test general purpose registers and APSR flags with 0x55555555 and 0xAAAAAAAA */
     register uint32_t val1 = 0x55555555U;
     register uint32_t val2 = 0xAAAAAAAAU;
-    
+
     __asm volatile (
         "movs r0, %0\n"
         "cmp  r0, %0\n"
@@ -167,19 +167,19 @@ bool Safety_MarchC_Slice(uint32_t *p_start, uint32_t words_to_scan)
 {
     for (uint32_t i = 0; i < words_to_scan; i++) {
         uint32_t orig_val = p_start[i];
-        
+
         /* Up: Write 0, Verify 0 */
         p_start[i] = 0x00000000U;
         if (p_start[i] != 0x00000000U) return false;
-        
+
         /* Up: Write 1, Verify 1 */
         p_start[i] = 0xFFFFFFFFU;
         if (p_start[i] != 0xFFFFFFFFU) return false;
-        
+
         /* Down: Write 0, Verify 0 */
         p_start[i] = 0x00000000U;
         if (p_start[i] != 0x00000000U) return false;
-        
+
         /* Restore original RAM contents */
         p_start[i] = orig_val;
     }
@@ -217,6 +217,6 @@ typedef struct {
     uint32_t entry_point_addr;     /* Reset vector execution address */
     uint8_t  sha256_digest[32];    /* SHA-256 hash of image payload */
     uint8_t  ecdsa_signature[64];  /* ECDSA secp256r1 signature (R, S) */
-    uint8_t  reserved[140];        /* Future cryptographic extensions */
+    uint8_t  reserved[136];        /* Future cryptographic extensions (256 bytes total) */
 } __attribute__((packed)) FirmwareHeader_t;
 ```

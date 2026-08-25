@@ -168,7 +168,7 @@ static volatile uint32_t s_jitter_violations = 0U;
 void ADC_IRQHandler_Monitored(void)
 {
     uint32_t t_start = DWT->CYCCNT;
-    
+
     // ... Inner Loop PID Computation ...
 
     uint32_t t_cycles = DWT->CYCCNT - t_start;

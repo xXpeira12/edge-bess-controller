@@ -57,7 +57,7 @@ The immutable Secure Bootloader occupies physical base address `0x0800_0000` ($3
 
 ```
                          BOOTLOADER EXECUTION FLOW
-                         
+
             +-------------------------------------------------------+
             |                   POWER-ON RESET                      |
             +-------------------------------------------------------+
