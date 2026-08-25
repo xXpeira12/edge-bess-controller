@@ -185,6 +185,155 @@ class TestSpecificationConsistency(unittest.TestCase):
         self.assertIn(40018, registers)
         self.assertEqual(registers[40018][0], "LATCHED_FAULT_FLAGS")
 
+    def test_anti_aliasing_filter_frequency_response(self):
+        """Verify 1st order RC anti-aliasing filter (R=1k, C=3.3nF) cut-off and attenuation."""
+        r_filt = 1000.0  # 1 kOhm
+        c_filt = 3.3e-9  # 3.3 nF
+        f_cutoff = 1.0 / (2.0 * math.pi * r_filt * c_filt)
+        self.assertAlmostEqual(f_cutoff / 1000.0, 48.229, places=2)
+
+        # Attenuation at f_Nyquist = 25 kHz: ~ -1.04 dB, ~ -27.4 deg phase
+        f_nyquist = 25000.0
+        h_nyquist_mag = 1.0 / math.sqrt(1.0 + (f_nyquist / f_cutoff) ** 2)
+        h_nyquist_db = 20.0 * math.log10(h_nyquist_mag)
+        h_nyquist_phase_deg = -math.degrees(math.atan(f_nyquist / f_cutoff))
+        self.assertAlmostEqual(h_nyquist_mag, 0.888, delta=0.002)
+        self.assertAlmostEqual(h_nyquist_db, -1.04, delta=0.02)
+        self.assertAlmostEqual(h_nyquist_phase_deg, -27.4, delta=0.2)
+
+        # Attenuation at f_sw = 50 kHz: ~ -3.17 dB, ~ -46.0 deg phase
+        f_sw = 50000.0
+        h_sw_mag = 1.0 / math.sqrt(1.0 + (f_sw / f_cutoff) ** 2)
+        h_sw_db = 20.0 * math.log10(h_sw_mag)
+        h_sw_phase_deg = -math.degrees(math.atan(f_sw / f_cutoff))
+        self.assertAlmostEqual(h_sw_mag, 0.694, delta=0.002)
+        self.assertAlmostEqual(h_sw_db, -3.17, delta=0.02)
+        self.assertAlmostEqual(h_sw_phase_deg, -46.0, delta=0.2)
+
+    def test_voltage_sensing_divider_and_ov_trip(self):
+        """Verify 10:1 resistor divider and 26.0V over-voltage trip derivation."""
+        r1 = 90000.0  # 90 kOhm
+        r2 = 10000.0  # 10 kOhm
+        k_div = r2 / (r1 + r2)  # 0.1000
+        self.assertAlmostEqual(k_div, 0.1000, places=4)
+
+        # Nominal Vbus = 24.0V -> V_adc = 2.400V
+        v_bus_nom = 24.0
+        v_adc_nom = v_bus_nom * k_div
+        self.assertAlmostEqual(v_adc_nom, 2.400, places=3)
+
+        # OV Trip Vbus = 26.0V -> V_comp = 2.600V
+        v_bus_ov = 26.0
+        v_comp_ov = v_bus_ov * k_div
+        self.assertAlmostEqual(v_comp_ov, 2.600, places=3)
+
+        # Tolerance budget: 26.0 +/- 0.5 V -> 2.600 +/- 0.050 V
+        v_ov_min = 25.5 * k_div
+        v_ov_max = 26.5 * k_div
+        self.assertAlmostEqual(v_ov_min, 2.550, places=3)
+        self.assertAlmostEqual(v_ov_max, 2.650, places=3)
+
+    def test_fsm_state_enum_and_recovery_policy(self):
+        """Verify FSM state enum definitions and FAULT_CLEAR_CMD transition authority."""
+        fsm_states = {
+            0: "STATE_POWER_ON",
+            1: "STATE_INIT_AND_SELF_TEST",
+            2: "STATE_IDLE",
+            3: "STATE_CHARGE_RAMP",
+            4: "STATE_CHARGE_ACTIVE",
+            5: "STATE_DISCHARGE_RAMP",
+            6: "STATE_DISCHARGE_ACTIVE",
+            7: "STATE_DERATING_ACTIVE",
+            8: "STATE_RECOVERY_CHECK",
+            9: "STATE_SAFE_STATE",
+        }
+        self.assertEqual(len(fsm_states), 10)
+        self.assertEqual(fsm_states[8], "STATE_RECOVERY_CHECK")
+        self.assertEqual(fsm_states[9], "STATE_SAFE_STATE")
+
+        # Command acceptance logic: 0x00A5 is accepted ONLY in STATE_SAFE_STATE (9)
+        def handle_fault_clear(current_state, cmd_key):
+            if cmd_key != 0x00A5:
+                return (current_state, 4)  # Rejected_Limit
+            if current_state == 9:  # STATE_SAFE_STATE
+                return (8, 1)  # Enter STATE_RECOVERY_CHECK, Accepted
+            return (current_state, 2)  # Rejected_InvalidState
+
+        # In SAFE_STATE -> transitions to RECOVERY_CHECK
+        new_state, result = handle_fault_clear(9, 0x00A5)
+        self.assertEqual(new_state, 8)
+        self.assertEqual(result, 1)
+
+        # In IDLE -> rejected
+        new_state, result = handle_fault_clear(2, 0x00A5)
+        self.assertEqual(new_state, 2)
+        self.assertEqual(result, 2)
+
+        # In CHARGE_ACTIVE -> rejected
+        new_state, result = handle_fault_clear(4, 0x00A5)
+        self.assertEqual(new_state, 4)
+        self.assertEqual(result, 2)
+
+    def test_derating_hysteresis_bands(self):
+        """Verify temperature, low SOC, and high SOC derating entry/exit hysteresis."""
+        # Heatsink Temperature: Enter > 55.0 C, Exit < 45.0 C
+        t_enter = 55.0
+        t_exit = 45.0
+        self.assertGreater(t_enter, t_exit)
+        self.assertEqual(t_enter - t_exit, 10.0)
+
+        # Low SOC: Enter < 15.0 %, Exit > 20.0 %
+        soc_low_enter = 15.0
+        soc_low_exit = 20.0
+        self.assertLess(soc_low_enter, soc_low_exit)
+        self.assertEqual(soc_low_exit - soc_low_enter, 5.0)
+
+        # High SOC: Enter > 95.0 %, Exit < 90.0 %
+        soc_high_enter = 95.0
+        soc_high_exit = 90.0
+        self.assertGreater(soc_high_enter, soc_high_exit)
+        self.assertEqual(soc_high_enter - soc_high_exit, 5.0)
+
+    def test_boot_metadata_record_structure(self):
+        """Verify BootMetadataRecord_t struct size (136 bytes), magic, and commit marker."""
+        # uint32_t record_magic (4)
+        # uint32_t sequence_num (4)
+        # uint32_t active_slot (4)
+        # uint32_t slot_state (4)
+        # uint32_t security_version (4)
+        # uint32_t boot_attempts (4)
+        # uint32_t image_size_bytes (4)
+        # uint32_t image_crc32 (4)
+        # uint8_t  sha256_digest[32] (32)
+        # uint8_t  ecdsa_signature[64] (64)
+        # uint32_t payload_crc32 (4)
+        # uint32_t commit_marker (4)
+        fmt = ">IIIIIIII32s64sII"
+        record_size = struct.calcsize(fmt)
+        self.assertEqual(record_size, 136)
+
+        magic = 0x42455353  # "BESS"
+        commit_marker = 0xAA55AA55
+        packed = struct.pack(
+            fmt,
+            magic,
+            1,       # seq
+            0,       # slot A
+            4,       # CONFIRMED
+            1,       # sec ver
+            0,       # boot attempts
+            128000,  # size
+            0x12345678,
+            b"\x00" * 32,
+            b"\x00" * 64,
+            0xCAFEBABE,
+            commit_marker,
+        )
+        self.assertEqual(len(packed), 136)
+        unpacked_magic, _, _, _, _, _, _, _, _, _, _, unpacked_commit = struct.unpack(fmt, packed)
+        self.assertEqual(unpacked_magic, 0x42455353)
+        self.assertEqual(unpacked_commit, 0xAA55AA55)
+
     def test_spi_ipc_frame_16bit_seq_and_crc(self):
         """Verify SPI DMA binary frame with 16-bit SEQ_NUM and CRC16-CCITT."""
         sync_word = 0xA55A
